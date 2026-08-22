@@ -22,6 +22,11 @@ ELEMENT_SUMMARY_SLEEP_SECONDS = 0.2
 # DefCon 2pt threshold: 10 CBIT for defenders/keepers, 12 CBIRT for mids/forwards.
 DEFCON_THRESHOLD_BY_POS = {"GKP": 10, "DEF": 10, "MID": 12, "FWD": 12}
 
+HOME_FIXTURE_DISCOUNT = 0.3
+
+# rank_score weights, keyed by the same names used in rank_components/rank_basis.
+RANK_WEIGHTS = {"xgi_per90": 3, "minutes_ratio": 2, "fixture_score_inverted": 2, "points_per_million": 1}
+
 # Fields kept per gameweek in the cache -- just enough to derive the stats below.
 HISTORY_FIELDS = ("round", "minutes", "starts", "expected_goals", "expected_assists", "defensive_contribution", "bonus")
 
@@ -177,6 +182,45 @@ def build_fixtures_next6(fixtures, teams_by_id, club_ids):
     return fixtures_next6
 
 
+def compute_fixture_score(club_fixtures, count):
+    """Sum of FDR over the next `count` fixtures; home games discounted since
+    they're easier. None (not 0) when there's no fixture data to score."""
+    subset = club_fixtures[:count]
+    if not subset:
+        return None
+    total = sum((f["difficulty"] - HOME_FIXTURE_DISCOUNT) if f["is_home"] else f["difficulty"] for f in subset)
+    return round(total, 2)
+
+
+def attach_fixture_scores(records, fixtures_next6):
+    for record in records:
+        club_fixtures = fixtures_next6.get(record["club"], [])
+        record["fixture_score"] = compute_fixture_score(club_fixtures, 6)
+        record["fdr_next3"] = compute_fixture_score(club_fixtures, 3)
+
+
+def compute_rank(player):
+    """Weighted composite for sorting the watchlist. Null components are
+    skipped entirely (not treated as zero); rank_basis records which of the
+    four went into the score actually used."""
+    values = {
+        "xgi_per90": player["xgi_per90"],
+        "minutes_ratio": (player["minutes_per_app"] / 90) if player["minutes_per_app"] is not None else None,
+        "fixture_score_inverted": (-player["fixture_score"]) if player["fixture_score"] is not None else None,
+        "points_per_million": player["points_per_million"],
+    }
+    rank_basis = [name for name, value in values.items() if value is not None]
+    rank_score = round(sum(RANK_WEIGHTS[name] * values[name] for name in rank_basis), 3) if rank_basis else None
+    rank_components = {name: (round(value, 3) if value is not None else None) for name, value in values.items()}
+    return rank_score, rank_basis, rank_components
+
+
+def rank_and_sort_watchlist(watchlist):
+    for player in watchlist:
+        player["rank_score"], player["rank_basis"], player["rank_components"] = compute_rank(player)
+    watchlist.sort(key=lambda p: (p["rank_score"] is None, -(p["rank_score"] or 0)))
+
+
 def build_rivals(league_ids, picks_gw, elements):
     rivals = {}
     for league_id in league_ids:
@@ -243,6 +287,7 @@ def main():
         "minutes_total": None, "minutes_per_app": None, "starts": None, "apps": None,
         "xg_per90": None, "xa_per90": None, "xgi_per90": None, "defcon_per90": None,
         "defcon_hit_rate": None, "points_per_million": None, "bonus_total": None,
+        "fixture_score": None, "fdr_next3": None,
     }
     my_squad = [
         player_record(elements[pid], teams_by_id, types_by_id, empty_stats)
@@ -262,6 +307,10 @@ def main():
 
     watched_club_ids = {elements[p["player_id"]]["team"] for p in my_squad + watchlist}
     fixtures_next6 = build_fixtures_next6(fixtures, teams_by_id, watched_club_ids)
+
+    attach_fixture_scores(my_squad, fixtures_next6)
+    attach_fixture_scores(watchlist, fixtures_next6)
+    rank_and_sort_watchlist(watchlist)
 
     rivals = build_rivals(league_ids, picks_gw, elements)
 
