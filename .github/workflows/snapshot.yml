@@ -30,7 +30,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add snapshot.json
+          git add snapshot.json data/element_summary_cache.json
           if git diff --cached --quiet; then
             echo "No changes to snapshot.json"
           else
