@@ -283,6 +283,13 @@ def compute_league_anchors(rolling_by_club):
     }
 
 
+def relative_strength(team_rating, league_mean_rating):
+    """team_rating / league_mean_rating, defined as 1.0 (average) if the
+    league mean is 0 -- FPL occasionally reports every club's strength
+    rating as 0 (e.g. before they're published for a new season)."""
+    return team_rating / league_mean_rating if league_mean_rating else 1.0
+
+
 def build_team_strength(elements, teams_by_id, histories):
     """Rolling last-6 (home/away split) xG-based team strength, blended with
     FPL's own strength ratings before there's enough rolling data (i.e.
@@ -320,11 +327,14 @@ def build_team_strength(elements, teams_by_id, histories):
             rolling_weight = min(roll["matches_in_window"] / TEAM_STRENGTH_WINDOW, 1.0)
             prior_weight = round(1 - rolling_weight, 3)
 
-            relative_attack = team[attack_key] / fpl_means[f"attack_{venue}"]
-            relative_defence = team[defence_key] / fpl_means[f"defence_{venue}"]
+            # FPL sometimes reports these ratings as 0 for every club (e.g. before
+            # they're published for a new season) -- fall back to "average" (1.0)
+            # rather than dividing by zero when the league mean itself is 0.
+            relative_attack = relative_strength(team[attack_key], fpl_means[f"attack_{venue}"])
+            relative_defence = relative_strength(team[defence_key], fpl_means[f"defence_{venue}"])
             prior_xg_for = anchors["xg_for_per_match"] * relative_attack
             # Stronger defence (higher rating) -> concedes less -> divide, not multiply.
-            prior_xg_against = anchors["xg_against_per_match"] / relative_defence
+            prior_xg_against = anchors["xg_against_per_match"] / relative_defence if relative_defence else anchors["xg_against_per_match"]
             prior_clean_sheet_rate = min(anchors["clean_sheet_rate"] * relative_defence, 1.0)
 
             def blend(rolling_value, prior_value):
