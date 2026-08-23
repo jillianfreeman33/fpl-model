@@ -1,71 +1,88 @@
 #!/usr/bin/env python3
-"""Throwaway probe: which free source can give us per-club European fixtures?
+"""Throwaway probe round 2.
 
-Run from the GitHub Actions runner (the dev sandbox has no egress to these
-hosts). Prints reachability and payload shape for each candidate so we can
-pick one before wiring it into snapshot.py. Delete once a source is chosen.
+Round 1 result: TheSportsDB free tier truncates to 5-15 events (July qualifiers
+only, no English clubs); football-data.org returns 403 without a paid token;
+openfootball root is a README. Now testing ESPN's free unauthenticated API and
+openfootball's actual data tree.
 """
 import json
 
 import requests
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; fpl-snapshot-bot/1.0)"}
-SEASON = "2026-2027"
 ENGLISH_HINTS = ("Arsenal", "Manchester", "Aston Villa", "Liverpool", "Bournemouth",
                  "Sunderland", "Crystal Palace", "Brighton")
+ESPN_LEAGUES = {"UCL": "uefa.champions", "UEL": "uefa.europa", "UECL": "uefa.europa.conf"}
 
 
-def show(label, url, **kwargs):
-    print(f"\n{'=' * 70}\n{label}\n{url}\n{'-' * 70}")
+def fetch(label, url, **kwargs):
+    print(f"\n{'=' * 70}\n{label}\n{url}  {kwargs.get('params','')}\n{'-' * 70}")
     try:
         resp = requests.get(url, headers=HEADERS, timeout=25, **kwargs)
     except Exception as exc:
         print(f"  UNREACHABLE: {type(exc).__name__}: {exc}")
         return None
-    print(f"  HTTP {resp.status_code}  content-type={resp.headers.get('content-type','?')}  bytes={len(resp.content)}")
+    print(f"  HTTP {resp.status_code}  bytes={len(resp.content)}")
     if resp.status_code != 200:
-        print(f"  body[:300]: {resp.text[:300]}")
+        print(f"  body[:200]: {resp.text[:200]}")
         return None
     try:
         return resp.json()
     except ValueError:
-        print(f"  NOT JSON. body[:300]: {resp.text[:300]}")
-        return None
+        print(f"  not JSON. body[:200]: {resp.text[:200]}")
+        return resp.text
 
 
-def summarize_sportsdb(data, league):
-    events = (data or {}).get("events")
-    if not events:
-        print(f"  no 'events' key or empty. keys={list((data or {}).keys())}")
+def summarize_espn(data):
+    if not isinstance(data, dict):
         return
-    print(f"  events returned: {len(events)}")
-    sample = events[0]
-    print(f"  sample keys: {sorted(sample.keys())[:18]}")
-    print(f"  sample: {sample.get('dateEvent')} {sample.get('strTime')} | "
-          f"{sample.get('strHomeTeam')} v {sample.get('strAwayTeam')} | round={sample.get('intRound')}")
-    english = [e for e in events
-               if any(h in f"{e.get('strHomeTeam','')} {e.get('strAwayTeam','')}" for h in ENGLISH_HINTS)]
-    print(f"  fixtures involving English clubs: {len(english)}")
-    for e in english[:6]:
-        print(f"    {e.get('dateEvent')} {e.get('strTime') or '':>8}  "
-              f"{e.get('strHomeTeam')} v {e.get('strAwayTeam')}  (round {e.get('intRound')})")
+    events = data.get("events") or []
+    print(f"  events: {len(events)}")
+    if not events:
+        print(f"  top-level keys: {list(data.keys())[:12]}")
+        return
+    for e in events[:4]:
+        names = [c.get("team", {}).get("displayName") for c in
+                 (e.get("competitions") or [{}])[0].get("competitors", [])]
+        print(f"    {e.get('date')}  {' v '.join(n for n in names if n)}")
+    english = [e for e in events if any(
+        h in json.dumps(e.get("competitions", [{}])[0].get("competitors", [])) for h in ENGLISH_HINTS)]
+    print(f"  involving English clubs: {len(english)}")
+    for e in english[:8]:
+        names = [c.get("team", {}).get("displayName") for c in
+                 (e.get("competitions") or [{}])[0].get("competitors", [])]
+        print(f"    ENG> {e.get('date')}  {' v '.join(n for n in names if n)}")
 
 
-for key in ("3", "123"):
-    for league_id, league in (("4480", "UCL"), ("4481", "UEL"), ("5071", "UECL")):
-        data = show(
-            f"TheSportsDB v1 key={key} eventsseason {league}",
-            f"https://www.thesportsdb.com/api/v1/json/{key}/eventsseason.php",
-            params={"id": league_id, "s": SEASON},
-        )
-        if data is not None:
-            summarize_sportsdb(data, league)
-    # One key is usually enough; only try the second if the first gave nothing.
+# 1. ESPN scoreboard over the league-phase window, per competition.
+for label, slug in ESPN_LEAGUES.items():
+    data = fetch(f"ESPN scoreboard {label} (league-phase window)",
+                 f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard",
+                 params={"dates": "20260908-20260918"})
+    summarize_espn(data)
 
-show("football-data.org v4 CL matches (no token -> expect 401/403, tests reachability)",
-     "https://api.football-data.org/v4/competitions/CL/matches", params={"season": "2026"})
+# 2. ESPN full-season range, to see whether it will serve a wide window at once.
+data = fetch("ESPN scoreboard UCL (whole season range)",
+             "https://site.api.espn.com/apis/site/v2/sports/soccer/uefa.champions/scoreboard",
+             params={"dates": "20260901-20270601"})
+summarize_espn(data)
 
-show("openfootball champions-league raw (no key)",
-     "https://raw.githubusercontent.com/openfootball/champions-league/master/README.md")
+# 3. ESPN per-team schedule, which would sidestep date-window paging entirely.
+data = fetch("ESPN teams list UCL (to find club ids)",
+             "https://site.api.espn.com/apis/site/v2/sports/soccer/uefa.champions/teams")
+if isinstance(data, dict):
+    try:
+        teams = data["sports"][0]["leagues"][0]["teams"]
+        print(f"  teams: {len(teams)}")
+        for t in teams[:10]:
+            print(f"    id={t['team'].get('id'):>6}  {t['team'].get('displayName')}")
+    except (KeyError, IndexError) as exc:
+        print(f"  unexpected shape: {exc}; keys={list(data.keys())[:10]}")
 
-print("\nPROBE COMPLETE")
+# 4. openfootball actual data tree for 2026-27.
+for path in ("2026-27", "2026-27/cl.txt"):
+    fetch(f"openfootball champions-league contents {path}",
+          f"https://api.github.com/repos/openfootball/champions-league/contents/{path}")
+
+print("\nPROBE 2 COMPLETE")
