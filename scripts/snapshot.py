@@ -481,17 +481,46 @@ def parse_kickoff_date(value):
 
 
 def load_european_fixtures(config):
-    """club -> European kickoffs as (date, competition), ascending. Hand-maintained
-    in config: the FPL API covers the Premier League only, so there is nowhere to
-    derive European dates from."""
+    """club -> European dates as (date, competition, basis), ascending.
+
+    The FPL API is Premier League only, so European dates come from config. Two
+    sources, in priority order per club:
+
+    1. european_fixtures -- exact kickoffs, once a draw has assigned them.
+    2. european_matchdays -- the published league-phase matchday windows, which
+       are fixed long before the draws. A club plays exactly one date per
+       window, but which one is unknown until the draw, so every date in the
+       window is treated as a candidate. Nearest-preceding selection then lands
+       on the window's last date, making recovery_days the worst case (the least
+       rest the club could have had) rather than an invented exact figure.
+    """
     european_clubs = config.get("european_clubs", {})
-    by_club = defaultdict(list)
+    matchdays = config.get("european_matchdays", {})
+
+    explicit = defaultdict(list)
     for entry in config.get("european_fixtures", []):
         club = entry.get("club")
         kickoff_date = parse_kickoff_date(entry.get("kickoff"))
         if not club or kickoff_date is None:
             continue
-        by_club[club].append((kickoff_date, entry.get("competition") or european_clubs.get(club)))
+        competition = entry.get("competition") or european_clubs.get(club)
+        explicit[club].append((kickoff_date, competition, "exact_kickoff"))
+
+    by_club = {}
+    for club, competition in european_clubs.items():
+        if explicit.get(club):
+            by_club[club] = explicit[club]
+            continue
+        by_club[club] = [
+            (date, competition, "matchday_window")
+            for window in matchdays.get(competition, [])
+            for date in (parse_kickoff_date(d) for d in window)
+            if date is not None
+        ]
+    # A club given exact fixtures but missing from european_clubs still counts.
+    for club, dates in explicit.items():
+        by_club.setdefault(club, dates)
+
     for club_dates in by_club.values():
         club_dates.sort(key=lambda item: item[0])
     return by_club
@@ -502,20 +531,25 @@ def annotate_european_context(fixtures_next6, european_by_club):
     commitment. Informational only -- deliberately applied after scoring and
     ranking, and read by nothing downstream.
 
-    recovery_days counts calendar days from the European kickoff to this league
+    recovery_days counts calendar days from the European date to this league
     kickoff (a Thursday UEL tie before a Sunday league game is 3, before a
     Saturday one is 2), which is why this is computed from dates rather than
-    from a "played midweek" day-of-week flag."""
+    from a "played midweek" day-of-week flag.
+
+    recovery_days_basis says how precise the figure is: exact_kickoff means it
+    came from a known kickoff, matchday_window means the draw has not assigned
+    the club a date yet and this is the worst case within the window."""
     for club, club_fixtures in fixtures_next6.items():
         european_dates = european_by_club.get(club, [])
         for fixture in club_fixtures:
             pl_date = parse_kickoff_date(fixture.get("kickoff_time"))
             recovery_days = None
             competition = None
+            basis = None
             if pl_date is not None:
                 preceding = [item for item in european_dates if item[0] <= pl_date]
                 if preceding:
-                    european_date, european_competition = preceding[-1]
+                    european_date, european_competition, basis = preceding[-1]
                     recovery_days = (pl_date - european_date).days
                     if recovery_days <= EUROPEAN_RECOVERY_THRESHOLD_DAYS:
                         competition = european_competition
@@ -524,6 +558,7 @@ def annotate_european_context(fixtures_next6, european_by_club):
             )
             fixture["competition"] = competition
             fixture["recovery_days"] = recovery_days
+            fixture["recovery_days_basis"] = basis
 
 
 def build_rivals(league_ids, picks_gw, elements):
@@ -625,10 +660,11 @@ def main():
     european_clubs = config.get("european_clubs", {})
     european_by_club = load_european_fixtures(config)
     annotate_european_context(fixtures_next6, european_by_club)
-    if european_clubs and not european_by_club:
+    undated = sorted(club for club in european_clubs if not european_by_club.get(club))
+    if undated:
         print(
-            "NOTE: european_clubs is set but european_fixtures is empty -- "
-            "recovery_days will be null for every fixture until it is populated.",
+            "NOTE: no European dates for " + ", ".join(undated) + " -- add their competition to "
+            "european_matchdays, or the clubs to european_fixtures.",
             file=sys.stderr,
         )
 

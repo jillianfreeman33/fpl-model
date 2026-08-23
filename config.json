@@ -3,19 +3,51 @@
   "league_ids": [184717, 441887],
   "watchlist_size": 60,
 
-  "_comment_european_clubs": "The nine clubs in Europe this season, club short_name -> UCL | UEL | UECL. Maintained by hand. VERIFY THIS LIST -- it is seeded with a best guess.",
+  "_comment_european_clubs": "The nine English clubs in Europe in 2026/27, club short_name -> UCL | UEL | UECL. Sourced from the 2025/26 Premier League final table and cup outcomes (Man City won both domestic cups, pushing UEL/UECL places down the table; Chelsea missed out entirely).",
   "european_clubs": {
     "ARS": "UCL",
-    "LIV": "UCL",
     "MCI": "UCL",
-    "CHE": "UCL",
-    "NEW": "UCL",
-    "TOT": "UCL",
-    "AVL": "UEL",
-    "NFO": "UEL",
-    "CRY": "UECL"
+    "MUN": "UCL",
+    "AVL": "UCL",
+    "LIV": "UCL",
+    "BOU": "UEL",
+    "SUN": "UEL",
+    "CRY": "UEL",
+    "BHA": "UECL"
   },
 
-  "_comment_european_fixtures": "European kickoffs, maintained by hand -- the FPL API is Premier League only, so recovery_days cannot be derived without these. 'kickoff' accepts a date (2026-09-16) or a full ISO timestamp. 'competition' is optional and defaults to the club's entry in european_clubs. While this list is empty, every fixture reports recovery_days null and european_fixture_within_4_days false.",
+  "_comment_european_matchdays": "Published UEFA league-phase matchday windows for 2026/27. Each inner list is one matchday; a club plays exactly one of those dates. Used to derive recovery_days while the league-phase draws (UCL 27 Aug 2026) have not yet assigned per-club fixtures, so recovery_days is the WORST CASE -- measured from the last date in the window, i.e. the least rest the club could have had. Fixtures scored this way are marked recovery_days_basis matchday_window.",
+  "european_matchdays": {
+    "UCL": [
+      ["2026-09-08", "2026-09-09", "2026-09-10"],
+      ["2026-10-13", "2026-10-14"],
+      ["2026-10-20", "2026-10-21"],
+      ["2026-11-03", "2026-11-04"],
+      ["2026-11-24", "2026-11-25"],
+      ["2026-12-08", "2026-12-09"],
+      ["2027-01-19", "2027-01-20"],
+      ["2027-01-27"]
+    ],
+    "UEL": [
+      ["2026-09-16", "2026-09-17"],
+      ["2026-10-15"],
+      ["2026-10-22"],
+      ["2026-11-05"],
+      ["2026-11-26"],
+      ["2026-12-10"],
+      ["2027-01-21"],
+      ["2027-01-28"]
+    ],
+    "UECL": [
+      ["2026-10-15"],
+      ["2026-10-22"],
+      ["2026-11-05"],
+      ["2026-11-26"],
+      ["2026-12-10"],
+      ["2026-12-17"]
+    ]
+  },
+
+  "_comment_european_fixtures": "Exact per-club European kickoffs, once the draws are made. Any club listed here uses these instead of the matchday windows above, and its fixtures are marked recovery_days_basis exact_kickoff. 'kickoff' accepts a date or a full ISO timestamp; 'competition' defaults to the club's european_clubs entry.",
   "european_fixtures": []
 }
