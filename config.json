@@ -1,8 +1,10 @@
 {
   "entry_id": 685575,
-  "league_ids": [184717, 441887],
+  "league_ids": [
+    184717,
+    441887
+  ],
   "watchlist_size": 60,
-
   "_comment_european_clubs": "The nine English clubs in Europe in 2026/27, club short_name -> UCL | UEL | UECL. Sourced from the 2025/26 Premier League final table and cup outcomes (Man City won both domestic cups, pushing UEL/UECL places down the table; Chelsea missed out entirely).",
   "european_clubs": {
     "ARS": "UCL",
@@ -15,39 +17,178 @@
     "CRY": "UEL",
     "BHA": "UECL"
   },
-
-  "_comment_european_matchdays": "Published UEFA league-phase matchday windows for 2026/27. Each inner list is one matchday; a club plays exactly one of those dates. Used to derive recovery_days while the league-phase draws (UCL 27 Aug 2026) have not yet assigned per-club fixtures, so recovery_days is the WORST CASE -- measured from the last date in the window, i.e. the least rest the club could have had. Fixtures scored this way are marked recovery_days_basis matchday_window.",
+  "_comment_european_matchdays": "Published UEFA league-phase AND knockout matchday windows for 2026/27. Each inner list is one matchday; a club plays at most one of those dates. Used to derive recovery_days while the draws have not assigned per-club fixtures, so recovery_days is the WORST CASE -- measured from the last date in the window, i.e. the least rest the club could have had. Marked recovery_days_basis matchday_window. KNOWN GAP: the UEL final date is not included (not confirmed at time of writing).",
   "european_matchdays": {
     "UCL": [
-      ["2026-09-08", "2026-09-09", "2026-09-10"],
-      ["2026-10-13", "2026-10-14"],
-      ["2026-10-20", "2026-10-21"],
-      ["2026-11-03", "2026-11-04"],
-      ["2026-11-24", "2026-11-25"],
-      ["2026-12-08", "2026-12-09"],
-      ["2027-01-19", "2027-01-20"],
-      ["2027-01-27"]
+      [
+        "2026-09-08",
+        "2026-09-09",
+        "2026-09-10"
+      ],
+      [
+        "2026-10-13",
+        "2026-10-14"
+      ],
+      [
+        "2026-10-20",
+        "2026-10-21"
+      ],
+      [
+        "2026-11-03",
+        "2026-11-04"
+      ],
+      [
+        "2026-11-24",
+        "2026-11-25"
+      ],
+      [
+        "2026-12-08",
+        "2026-12-09"
+      ],
+      [
+        "2027-01-19",
+        "2027-01-20"
+      ],
+      [
+        "2027-01-27"
+      ],
+      [
+        "2027-02-16",
+        "2027-02-17"
+      ],
+      [
+        "2027-02-23",
+        "2027-02-24"
+      ],
+      [
+        "2027-03-09",
+        "2027-03-10"
+      ],
+      [
+        "2027-03-16",
+        "2027-03-17"
+      ],
+      [
+        "2027-04-06",
+        "2027-04-07"
+      ],
+      [
+        "2027-04-13",
+        "2027-04-14"
+      ],
+      [
+        "2027-04-27",
+        "2027-04-28"
+      ],
+      [
+        "2027-05-04",
+        "2027-05-05"
+      ],
+      [
+        "2027-06-05"
+      ]
     ],
     "UEL": [
-      ["2026-09-16", "2026-09-17"],
-      ["2026-10-15"],
-      ["2026-10-22"],
-      ["2026-11-05"],
-      ["2026-11-26"],
-      ["2026-12-10"],
-      ["2027-01-21"],
-      ["2027-01-28"]
+      [
+        "2026-09-16",
+        "2026-09-17"
+      ],
+      [
+        "2026-10-15"
+      ],
+      [
+        "2026-10-22"
+      ],
+      [
+        "2026-11-05"
+      ],
+      [
+        "2026-11-26"
+      ],
+      [
+        "2026-12-10"
+      ],
+      [
+        "2027-01-21"
+      ],
+      [
+        "2027-01-28"
+      ],
+      [
+        "2027-02-18"
+      ],
+      [
+        "2027-02-25"
+      ],
+      [
+        "2027-03-11"
+      ],
+      [
+        "2027-03-18"
+      ],
+      [
+        "2027-04-08"
+      ],
+      [
+        "2027-04-15"
+      ],
+      [
+        "2027-04-29"
+      ],
+      [
+        "2027-05-06"
+      ]
     ],
     "UECL": [
-      ["2026-10-15"],
-      ["2026-10-22"],
-      ["2026-11-05"],
-      ["2026-11-26"],
-      ["2026-12-10"],
-      ["2026-12-17"]
+      [
+        "2026-10-15"
+      ],
+      [
+        "2026-10-22"
+      ],
+      [
+        "2026-11-05"
+      ],
+      [
+        "2026-11-26"
+      ],
+      [
+        "2026-12-10"
+      ],
+      [
+        "2026-12-17"
+      ],
+      [
+        "2027-02-18"
+      ],
+      [
+        "2027-02-25"
+      ],
+      [
+        "2027-03-11"
+      ],
+      [
+        "2027-03-18"
+      ],
+      [
+        "2027-04-08"
+      ],
+      [
+        "2027-04-15"
+      ],
+      [
+        "2027-04-29"
+      ],
+      [
+        "2027-05-06"
+      ],
+      [
+        "2027-06-02"
+      ]
     ]
   },
-
   "_comment_european_fixtures": "Exact per-club European kickoffs, once the draws are made. Any club listed here uses these instead of the matchday windows above, and its fixtures are marked recovery_days_basis exact_kickoff. 'kickoff' accepts a date or a full ISO timestamp; 'competition' defaults to the club's european_clubs entry.",
-  "european_fixtures": []
+  "european_fixtures": [],
+  "_comment_european_exit": "Optional. Once a club is knocked out (or fails to qualify from the league phase), put the date here and no European dates after it will be attributed to them. Without this, knockout windows would flag eliminated clubs as having midweek games they are not playing. Empty = still involved.",
+  "european_exit": {}
 }

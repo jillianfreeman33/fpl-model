@@ -30,6 +30,10 @@ RANK_WEIGHTS = {"xgi_per90": 3, "minutes_per_app": 2, "fixture_score": 2, "point
 # A European tie this many calendar days or fewer before a league kickoff is flagged.
 EUROPEAN_RECOVERY_THRESHOLD_DAYS = 4
 
+# Beyond this gap a preceding European tie has no bearing on recovery, so report
+# null rather than a technically-true but meaningless figure like 73 days.
+EUROPEAN_MAX_LOOKBACK_DAYS = 14
+
 # Rolling team-strength window, and where the pre-season/early-season prior comes from.
 TEAM_STRENGTH_WINDOW = 6
 # Fallback league-average anchors (roughly PL historical norms) used only when there's
@@ -496,6 +500,7 @@ def load_european_fixtures(config):
     """
     european_clubs = config.get("european_clubs", {})
     matchdays = config.get("european_matchdays", {})
+    exits = {club: parse_kickoff_date(value) for club, value in config.get("european_exit", {}).items()}
 
     explicit = defaultdict(list)
     for entry in config.get("european_fixtures", []):
@@ -520,6 +525,11 @@ def load_european_fixtures(config):
     # A club given exact fixtures but missing from european_clubs still counts.
     for club, dates in explicit.items():
         by_club.setdefault(club, dates)
+
+    # Once a club is out, later windows are not theirs to be flagged against.
+    for club, exit_date in exits.items():
+        if exit_date and club in by_club:
+            by_club[club] = [item for item in by_club[club] if item[0] <= exit_date]
 
     for club_dates in by_club.values():
         club_dates.sort(key=lambda item: item[0])
@@ -549,16 +559,49 @@ def annotate_european_context(fixtures_next6, european_by_club):
             if pl_date is not None:
                 preceding = [item for item in european_dates if item[0] <= pl_date]
                 if preceding:
-                    european_date, european_competition, basis = preceding[-1]
-                    recovery_days = (pl_date - european_date).days
-                    if recovery_days <= EUROPEAN_RECOVERY_THRESHOLD_DAYS:
-                        competition = european_competition
+                    european_date, european_competition, candidate_basis = preceding[-1]
+                    gap = (pl_date - european_date).days
+                    if gap <= EUROPEAN_MAX_LOOKBACK_DAYS:
+                        recovery_days, basis = gap, candidate_basis
+                        if gap <= EUROPEAN_RECOVERY_THRESHOLD_DAYS:
+                            competition = european_competition
             fixture["european_fixture_within_4_days"] = (
                 recovery_days is not None and recovery_days <= EUROPEAN_RECOVERY_THRESHOLD_DAYS
             )
             fixture["competition"] = competition
             fixture["recovery_days"] = recovery_days
             fixture["recovery_days_basis"] = basis
+
+
+def warn_european_calendar_stale(european_clubs, european_by_club, fixtures_next6):
+    """The European calendar is hand-maintained, so it can silently fall behind
+    the season. Complain on stderr when a club has no dates at all, or when its
+    calendar ends before league fixtures we are already reporting on -- that is
+    the state in which recovery_days quietly goes null for midweek-laden weeks."""
+    undated = sorted(club for club in european_clubs if not european_by_club.get(club))
+    if undated:
+        print(
+            "NOTE: no European dates for " + ", ".join(undated)
+            + " -- add their competition to european_matchdays, or the clubs to european_fixtures.",
+            file=sys.stderr,
+        )
+
+    exhausted = []
+    for club in sorted(european_clubs):
+        dates = european_by_club.get(club)
+        if not dates:
+            continue
+        last_european = dates[-1][0]
+        pl_dates = [parse_kickoff_date(f.get("kickoff_time")) for f in fixtures_next6.get(club, [])]
+        pl_dates = [d for d in pl_dates if d is not None]
+        if pl_dates and max(pl_dates) > last_european:
+            exhausted.append(f"{club} (calendar ends {last_european}, fixtures run to {max(pl_dates)})")
+    if exhausted:
+        print(
+            "NOTE: European calendar is exhausted for " + "; ".join(exhausted)
+            + " -- recovery_days will read null for those fixtures until it is extended.",
+            file=sys.stderr,
+        )
 
 
 def build_rivals(league_ids, picks_gw, elements):
@@ -660,13 +703,7 @@ def main():
     european_clubs = config.get("european_clubs", {})
     european_by_club = load_european_fixtures(config)
     annotate_european_context(fixtures_next6, european_by_club)
-    undated = sorted(club for club in european_clubs if not european_by_club.get(club))
-    if undated:
-        print(
-            "NOTE: no European dates for " + ", ".join(undated) + " -- add their competition to "
-            "european_matchdays, or the clubs to european_fixtures.",
-            file=sys.stderr,
-        )
+    warn_european_calendar_stale(european_clubs, european_by_club, fixtures_next6)
 
     rivals = build_rivals(league_ids, picks_gw, elements)
 
