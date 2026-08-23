@@ -1,5 +1,21 @@
 {
   "entry_id": 685575,
   "league_ids": [184717, 441887],
-  "watchlist_size": 60
+  "watchlist_size": 60,
+
+  "_comment_european_clubs": "The nine clubs in Europe this season, club short_name -> UCL | UEL | UECL. Maintained by hand. VERIFY THIS LIST -- it is seeded with a best guess.",
+  "european_clubs": {
+    "ARS": "UCL",
+    "LIV": "UCL",
+    "MCI": "UCL",
+    "CHE": "UCL",
+    "NEW": "UCL",
+    "TOT": "UCL",
+    "AVL": "UEL",
+    "NFO": "UEL",
+    "CRY": "UECL"
+  },
+
+  "_comment_european_fixtures": "European kickoffs, maintained by hand -- the FPL API is Premier League only, so recovery_days cannot be derived without these. 'kickoff' accepts a date (2026-09-16) or a full ISO timestamp. 'competition' is optional and defaults to the club's entry in european_clubs. While this list is empty, every fixture reports recovery_days null and european_fixture_within_4_days false.",
+  "european_fixtures": []
 }

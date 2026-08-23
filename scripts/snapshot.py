@@ -27,6 +27,9 @@ DEFCON_THRESHOLD_BY_POS = {"GKP": 10, "DEF": 10, "MID": 12, "FWD": 12}
 # rank_score weights, applied to z-scores (fixture_score's z is negated: lower FDR-proxy is better).
 RANK_WEIGHTS = {"xgi_per90": 3, "minutes_per_app": 2, "fixture_score": 2, "points_per_million": 1}
 
+# A European tie this many calendar days or fewer before a league kickoff is flagged.
+EUROPEAN_RECOVERY_THRESHOLD_DAYS = 4
+
 # Rolling team-strength window, and where the pre-season/early-season prior comes from.
 TEAM_STRENGTH_WINDOW = 6
 # Fallback league-average anchors (roughly PL historical norms) used only when there's
@@ -197,7 +200,13 @@ def build_fixtures_next6(fixtures, teams_by_id, club_ids):
             # difficulty is FPL's own FDR, kept alongside our team-strength-based score
             # purely for comparison -- fixture_score below no longer derives from it.
             club_fixtures.append(
-                {"gw": f["event"], "opponent": opp, "is_home": is_home, "difficulty": difficulty}
+                {
+                    "gw": f["event"],
+                    "opponent": opp,
+                    "is_home": is_home,
+                    "difficulty": difficulty,
+                    "kickoff_time": f.get("kickoff_time"),
+                }
             )
             if len(club_fixtures) == 6:
                 break
@@ -460,6 +469,63 @@ def rank_and_sort_watchlist(watchlist, pool):
     return pool_stats
 
 
+def parse_kickoff_date(value):
+    """Calendar date from a date string or an ISO timestamp; None if unusable
+    (FPL leaves kickoff_time null for fixtures it hasn't scheduled yet)."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+
+
+def load_european_fixtures(config):
+    """club -> European kickoffs as (date, competition), ascending. Hand-maintained
+    in config: the FPL API covers the Premier League only, so there is nowhere to
+    derive European dates from."""
+    european_clubs = config.get("european_clubs", {})
+    by_club = defaultdict(list)
+    for entry in config.get("european_fixtures", []):
+        club = entry.get("club")
+        kickoff_date = parse_kickoff_date(entry.get("kickoff"))
+        if not club or kickoff_date is None:
+            continue
+        by_club[club].append((kickoff_date, entry.get("competition") or european_clubs.get(club)))
+    for club_dates in by_club.values():
+        club_dates.sort(key=lambda item: item[0])
+    return by_club
+
+
+def annotate_european_context(fixtures_next6, european_by_club):
+    """Tag each Premier League fixture with the club's own preceding European
+    commitment. Informational only -- deliberately applied after scoring and
+    ranking, and read by nothing downstream.
+
+    recovery_days counts calendar days from the European kickoff to this league
+    kickoff (a Thursday UEL tie before a Sunday league game is 3, before a
+    Saturday one is 2), which is why this is computed from dates rather than
+    from a "played midweek" day-of-week flag."""
+    for club, club_fixtures in fixtures_next6.items():
+        european_dates = european_by_club.get(club, [])
+        for fixture in club_fixtures:
+            pl_date = parse_kickoff_date(fixture.get("kickoff_time"))
+            recovery_days = None
+            competition = None
+            if pl_date is not None:
+                preceding = [item for item in european_dates if item[0] <= pl_date]
+                if preceding:
+                    european_date, european_competition = preceding[-1]
+                    recovery_days = (pl_date - european_date).days
+                    if recovery_days <= EUROPEAN_RECOVERY_THRESHOLD_DAYS:
+                        competition = european_competition
+            fixture["european_fixture_within_4_days"] = (
+                recovery_days is not None and recovery_days <= EUROPEAN_RECOVERY_THRESHOLD_DAYS
+            )
+            fixture["competition"] = competition
+            fixture["recovery_days"] = recovery_days
+
+
 def build_rivals(league_ids, picks_gw, elements):
     rivals = {}
     for league_id in league_ids:
@@ -555,6 +621,17 @@ def main():
     attach_fixture_scores(watchlist, fixtures_next6, team_strength)
     pool_stats = rank_and_sort_watchlist(watchlist, my_squad + watchlist)
 
+    # Informational only, and applied after every score above is already final.
+    european_clubs = config.get("european_clubs", {})
+    european_by_club = load_european_fixtures(config)
+    annotate_european_context(fixtures_next6, european_by_club)
+    if european_clubs and not european_by_club:
+        print(
+            "NOTE: european_clubs is set but european_fixtures is empty -- "
+            "recovery_days will be null for every fixture until it is populated.",
+            file=sys.stderr,
+        )
+
     rivals = build_rivals(league_ids, picks_gw, elements)
 
     price_watch = []
@@ -591,6 +668,7 @@ def main():
         "watchlist": watchlist,
         "watchlist_rank_stats": pool_stats,
         "fixtures_next6": fixtures_next6,
+        "european_clubs": european_clubs,
         "team_strength": team_strength,
         "rivals": rivals,
         "price_watch": price_watch,
