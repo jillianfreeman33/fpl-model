@@ -2,8 +2,10 @@
 """Fetch a daily FPL data snapshot and write it to snapshot.json."""
 import json
 import os
+import statistics
 import sys
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
 
 import requests
@@ -22,13 +24,28 @@ ELEMENT_SUMMARY_SLEEP_SECONDS = 0.2
 # DefCon 2pt threshold: 10 CBIT for defenders/keepers, 12 CBIRT for mids/forwards.
 DEFCON_THRESHOLD_BY_POS = {"GKP": 10, "DEF": 10, "MID": 12, "FWD": 12}
 
-HOME_FIXTURE_DISCOUNT = 0.3
+# rank_score weights, applied to z-scores (fixture_score's z is negated: lower FDR-proxy is better).
+RANK_WEIGHTS = {"xgi_per90": 3, "minutes_per_app": 2, "fixture_score": 2, "points_per_million": 1}
 
-# rank_score weights, keyed by the same names used in rank_components/rank_basis.
-RANK_WEIGHTS = {"xgi_per90": 3, "minutes_ratio": 2, "fixture_score_inverted": 2, "points_per_million": 1}
+# Rolling team-strength window, and where the pre-season/early-season prior comes from.
+TEAM_STRENGTH_WINDOW = 6
+# Fallback league-average anchors (roughly PL historical norms) used only when there's
+# no rolling data at all yet (e.g. before gameweek 1 has finished) to convert FPL's
+# strength ratings into pseudo-xG units.
+FALLBACK_XG_ANCHOR = 1.3
+FALLBACK_CLEAN_SHEET_ANCHOR = 0.28
 
-# Fields kept per gameweek in the cache -- just enough to derive the stats below.
-HISTORY_FIELDS = ("round", "minutes", "starts", "expected_goals", "expected_assists", "defensive_contribution", "bonus")
+# Bumping this forces a full cache refetch when the cached schema is missing fields
+# a newer version of this script needs (e.g. the team-strength inputs added later).
+CACHE_SCHEMA_VERSION = 2
+
+# Fields kept per gameweek in the cache -- just enough to derive player stats and,
+# aggregated across watched players' clubs, team-strength inputs.
+HISTORY_FIELDS = (
+    "round", "fixture", "was_home", "minutes", "starts",
+    "expected_goals", "expected_assists", "expected_goals_conceded",
+    "clean_sheets", "defensive_contribution", "bonus",
+)
 
 
 def get(path, **params):
@@ -56,10 +73,14 @@ def load_element_summary_cache():
     if not os.path.exists(ELEMENT_SUMMARY_CACHE_PATH):
         return {}
     with open(ELEMENT_SUMMARY_CACHE_PATH) as f:
-        return json.load(f)
+        cache = json.load(f)
+    if cache.get("_schema_version") != CACHE_SCHEMA_VERSION:
+        return {}
+    return cache
 
 
 def save_element_summary_cache(cache):
+    cache["_schema_version"] = CACHE_SCHEMA_VERSION
     os.makedirs(os.path.dirname(ELEMENT_SUMMARY_CACHE_PATH), exist_ok=True)
     with open(ELEMENT_SUMMARY_CACHE_PATH, "w") as f:
         json.dump(cache, f, separators=(",", ":"))
@@ -173,6 +194,8 @@ def build_fixtures_next6(fixtures, teams_by_id, club_ids):
                 opp, is_home, difficulty = teams_by_id[f["team_h"]]["short_name"], False, f["team_a_difficulty"]
             else:
                 continue
+            # difficulty is FPL's own FDR, kept alongside our team-strength-based score
+            # purely for comparison -- fixture_score below no longer derives from it.
             club_fixtures.append(
                 {"gw": f["event"], "opponent": opp, "is_home": is_home, "difficulty": difficulty}
             )
@@ -182,43 +205,249 @@ def build_fixtures_next6(fixtures, teams_by_id, club_ids):
     return fixtures_next6
 
 
-def compute_fixture_score(club_fixtures, count):
-    """Sum of FDR over the next `count` fixtures; home games discounted since
-    they're easier. None (not 0) when there's no fixture data to score."""
-    subset = club_fixtures[:count]
-    if not subset:
+def summarize_match_window(matches):
+    """Average the last TEAM_STRENGTH_WINDOW matches (already filtered to one
+    venue) into per-match rolling figures. None fields, not zero, when empty."""
+    subset = sorted(matches, key=lambda m: m["round"], reverse=True)[:TEAM_STRENGTH_WINDOW]
+    n = len(subset)
+    xg_for_vals = [m["xg_for"] for m in subset]
+    xg_against_vals = [m["xg_against"] for m in subset if m["xg_against"] is not None]
+    cs_vals = [m["clean_sheet"] for m in subset if m["clean_sheet"] is not None]
+    return {
+        "xg_for_per_match": round(statistics.fmean(xg_for_vals), 3) if xg_for_vals else None,
+        "xg_against_per_match": round(statistics.fmean(xg_against_vals), 3) if xg_against_vals else None,
+        "clean_sheet_rate": round(statistics.fmean(cs_vals), 3) if cs_vals else None,
+        "matches_in_window": n,
+    }
+
+
+def build_rolling_team_matches(elements, teams_by_id, histories):
+    """Reconstruct one row per (club, fixture) from the watched players' own
+    element-summary histories. expected_goals is summed across whichever of
+    the club's players we have data for (so it under-counts for clubs with
+    fewer watchlist/squad players -- an inherent limit of not fetching every
+    player on every club); expected_goals_conceded and clean_sheets are
+    team-level values reported identically by every player from that side in
+    that match, so any single sample for a given (club, fixture) is enough."""
+    match_log = {}
+    for player_id, history in histories.items():
+        team_short = teams_by_id[elements[player_id]["team"]]["short_name"]
+        for gw in history:
+            if not gw.get("minutes") or gw.get("fixture") is None:
+                continue
+            key = (team_short, gw["fixture"])
+            entry = match_log.setdefault(
+                key, {"round": gw["round"], "was_home": bool(gw.get("was_home")), "xg_for": 0.0,
+                      "xg_against_samples": [], "clean_sheet_samples": []},
+            )
+            entry["xg_for"] += float(gw.get("expected_goals") or 0)
+            if gw.get("expected_goals_conceded") is not None:
+                entry["xg_against_samples"].append(float(gw["expected_goals_conceded"]))
+            if gw.get("clean_sheets") is not None:
+                entry["clean_sheet_samples"].append(gw["clean_sheets"])
+
+    matches_by_club = defaultdict(list)
+    for (team_short, _fixture_id), entry in match_log.items():
+        matches_by_club[team_short].append(
+            {
+                "round": entry["round"],
+                "was_home": entry["was_home"],
+                "xg_for": round(entry["xg_for"], 3),
+                "xg_against": round(statistics.fmean(entry["xg_against_samples"]), 3)
+                if entry["xg_against_samples"] else None,
+                "clean_sheet": (1 if any(entry["clean_sheet_samples"]) else 0)
+                if entry["clean_sheet_samples"] else None,
+            }
+        )
+    return matches_by_club
+
+
+def compute_league_anchors(rolling_by_club):
+    """Pseudo-xG scale to convert FPL's own (unitless) strength ratings into
+    numbers comparable with our rolling per-match figures. Anchored to
+    whatever rolling data actually exists across the league so far; falls
+    back to fixed historical-average constants pre-season when there's none."""
+    xg_for_pool, xg_against_pool, cs_pool = [], [], []
+    for splits in rolling_by_club.values():
+        for split in splits.values():
+            if split["xg_for_per_match"] is not None:
+                xg_for_pool.append(split["xg_for_per_match"])
+            if split["xg_against_per_match"] is not None:
+                xg_against_pool.append(split["xg_against_per_match"])
+            if split["clean_sheet_rate"] is not None:
+                cs_pool.append(split["clean_sheet_rate"])
+    return {
+        "xg_for_per_match": round(statistics.fmean(xg_for_pool), 3) if xg_for_pool else FALLBACK_XG_ANCHOR,
+        "xg_against_per_match": round(statistics.fmean(xg_against_pool), 3) if xg_against_pool else FALLBACK_XG_ANCHOR,
+        "clean_sheet_rate": round(statistics.fmean(cs_pool), 3) if cs_pool else FALLBACK_CLEAN_SHEET_ANCHOR,
+    }
+
+
+def build_team_strength(elements, teams_by_id, histories):
+    """Rolling last-6 (home/away split) xG-based team strength, blended with
+    FPL's own strength ratings before there's enough rolling data (i.e.
+    before gameweek 7). matches_in_window/6 is the rolling weight; whatever
+    remains -- 1 full season prior to kickoff -- goes to the FPL-rating prior,
+    so a club with zero observed matches falls back to the prior entirely."""
+    all_clubs = list(teams_by_id.values())
+
+    rolling_by_club = {}
+    matches_by_club = build_rolling_team_matches(elements, teams_by_id, histories)
+    for team in all_clubs:
+        matches = matches_by_club.get(team["short_name"], [])
+        rolling_by_club[team["short_name"]] = {
+            "home": summarize_match_window([m for m in matches if m["was_home"]]),
+            "away": summarize_match_window([m for m in matches if not m["was_home"]]),
+        }
+
+    anchors = compute_league_anchors(rolling_by_club)
+    fpl_means = {
+        "attack_home": statistics.fmean(t["strength_attack_home"] for t in all_clubs),
+        "attack_away": statistics.fmean(t["strength_attack_away"] for t in all_clubs),
+        "defence_home": statistics.fmean(t["strength_defence_home"] for t in all_clubs),
+        "defence_away": statistics.fmean(t["strength_defence_away"] for t in all_clubs),
+    }
+
+    team_strength = {}
+    for team in all_clubs:
+        short = team["short_name"]
+        club_result = {}
+        for venue, attack_key, defence_key in (
+            ("home", "strength_attack_home", "strength_defence_home"),
+            ("away", "strength_attack_away", "strength_defence_away"),
+        ):
+            roll = rolling_by_club[short][venue]
+            rolling_weight = min(roll["matches_in_window"] / TEAM_STRENGTH_WINDOW, 1.0)
+            prior_weight = round(1 - rolling_weight, 3)
+
+            relative_attack = team[attack_key] / fpl_means[f"attack_{venue}"]
+            relative_defence = team[defence_key] / fpl_means[f"defence_{venue}"]
+            prior_xg_for = anchors["xg_for_per_match"] * relative_attack
+            # Stronger defence (higher rating) -> concedes less -> divide, not multiply.
+            prior_xg_against = anchors["xg_against_per_match"] / relative_defence
+            prior_clean_sheet_rate = min(anchors["clean_sheet_rate"] * relative_defence, 1.0)
+
+            def blend(rolling_value, prior_value):
+                observed = rolling_value if rolling_value is not None else prior_value
+                return round(rolling_weight * observed + prior_weight * prior_value, 3)
+
+            club_result[venue] = {
+                "xg_for_per_match": blend(roll["xg_for_per_match"], prior_xg_for),
+                "xg_against_per_match": blend(roll["xg_against_per_match"], prior_xg_against),
+                "clean_sheet_rate": blend(roll["clean_sheet_rate"], prior_clean_sheet_rate),
+                # Not exposed anywhere in the public FPL API (bootstrap-static and
+                # element-summary have no "big chances" stat) -- always null rather
+                # than fabricated, on both the rolling and the prior side.
+                "big_chances_conceded_per_match": None,
+                "matches_in_window": roll["matches_in_window"],
+                "prior_weight": prior_weight,
+            }
+        team_strength[short] = club_result
+    return team_strength
+
+
+# Per position group, which opponent team_strength fields drive fixture difficulty,
+# and in which direction. Null components (always true for big_chances_conceded_per_match,
+# since the API doesn't expose it) are skipped rather than zeroed.
+FIXTURE_DIFFICULTY_COMPONENTS = {
+    "MID": (("xg_against_per_match", -1.0), ("clean_sheet_rate", 3.0)),
+    "FWD": (("xg_against_per_match", -1.0), ("clean_sheet_rate", 3.0)),
+    "GKP": (("xg_for_per_match", 1.0), ("big_chances_conceded_per_match", 1.0)),
+    "DEF": (("xg_for_per_match", 1.0), ("big_chances_conceded_per_match", 1.0)),
+}
+
+
+def fixture_difficulty(pos, opponent_stats):
+    if not opponent_stats:
         return None
-    total = sum((f["difficulty"] - HOME_FIXTURE_DISCOUNT) if f["is_home"] else f["difficulty"] for f in subset)
-    return round(total, 2)
+    components = FIXTURE_DIFFICULTY_COMPONENTS[pos]
+    terms = [weight * opponent_stats[name] for name, weight in components if opponent_stats.get(name) is not None]
+    return round(sum(terms), 3) if terms else None
 
 
-def attach_fixture_scores(records, fixtures_next6):
+def compute_fixture_score(club_fixtures, count, pos, team_strength):
+    subset = club_fixtures[:count]
+    total = 0.0
+    counted = 0
+    for f in subset:
+        # Facing the opponent at the venue where they'll actually be playing:
+        # if we're home, they're away, and vice versa.
+        opponent_venue = "away" if f["is_home"] else "home"
+        opponent_stats = team_strength.get(f["opponent"], {}).get(opponent_venue)
+        difficulty = fixture_difficulty(pos, opponent_stats)
+        if difficulty is not None:
+            total += difficulty
+            counted += 1
+    return round(total, 3) if counted else None
+
+
+def attach_fixture_scores(records, fixtures_next6, team_strength):
     for record in records:
         club_fixtures = fixtures_next6.get(record["club"], [])
-        record["fixture_score"] = compute_fixture_score(club_fixtures, 6)
-        record["fdr_next3"] = compute_fixture_score(club_fixtures, 3)
+        record["fixture_score"] = compute_fixture_score(club_fixtures, 6, record["pos"], team_strength)
+        record["fdr_next3"] = compute_fixture_score(club_fixtures, 3, record["pos"], team_strength)
 
 
-def compute_rank(player):
-    """Weighted composite for sorting the watchlist. Null components are
-    skipped entirely (not treated as zero); rank_basis records which of the
-    four went into the score actually used."""
-    values = {
-        "xgi_per90": player["xgi_per90"],
-        "minutes_ratio": (player["minutes_per_app"] / 90) if player["minutes_per_app"] is not None else None,
-        "fixture_score_inverted": (-player["fixture_score"]) if player["fixture_score"] is not None else None,
-        "points_per_million": player["points_per_million"],
+def compute_pool_stats(pool, component_names):
+    """Mean/population-stdev per rank component across the full ranking pool
+    (squad + watchlist), ignoring nulls. std 0 -> every z-score for that
+    component is defined as 0 (compute_rank handles the division)."""
+    stats = {}
+    for name in component_names:
+        values = [p[name] for p in pool if p.get(name) is not None]
+        mean_ = round(statistics.fmean(values), 4) if values else 0.0
+        std_ = round(statistics.pstdev(values), 4) if len(values) > 1 else 0.0
+        stats[name] = {"mean": mean_, "std": std_, "n": len(values)}
+    return stats
+
+
+def zscore(value, stats):
+    if value is None:
+        return None
+    if stats["std"] == 0:
+        return 0.0
+    return (value - stats["mean"]) / stats["std"]
+
+
+def compute_rank(player, pool_stats):
+    """z-scored, null-safe weighted composite. Each present component is
+    converted to a z-score against the squad+watchlist pool before weighting,
+    so components on wildly different scales (fixture_score's raw xG units vs.
+    points_per_million) contribute comparably. Missing components are excluded
+    from both the numerator and the weight total, rather than zeroed, so a
+    player scored on 3 of 4 components isn't penalized against one scored on
+    all 4 -- rank_score is always effectively a weighted *average* of the
+    z-scores actually available."""
+    z = {
+        "xgi_per90": zscore(player.get("xgi_per90"), pool_stats["xgi_per90"]),
+        "minutes_per_app": zscore(player.get("minutes_per_app"), pool_stats["minutes_per_app"]),
+        "points_per_million": zscore(player.get("points_per_million"), pool_stats["points_per_million"]),
     }
-    rank_basis = [name for name, value in values.items() if value is not None]
-    rank_score = round(sum(RANK_WEIGHTS[name] * values[name] for name in rank_basis), 3) if rank_basis else None
-    rank_components = {name: (round(value, 3) if value is not None else None) for name, value in values.items()}
-    return rank_score, rank_basis, rank_components
+    fixture_z = zscore(player.get("fixture_score"), pool_stats["fixture_score"])
+    z["fixture_score"] = -fixture_z if fixture_z is not None else None  # lower fixture_score is better
+
+    rank_basis = [name for name in RANK_WEIGHTS if z[name] is not None]
+    rank_components = {name: (round(z[name], 4) if z[name] is not None else None) for name in RANK_WEIGHTS}
+    weights_used = {name: RANK_WEIGHTS[name] for name in rank_basis}
+
+    if not rank_basis:
+        return None, [], rank_components, {}
+
+    weight_total = sum(weights_used.values())
+    rank_score = round(sum(RANK_WEIGHTS[name] * z[name] for name in rank_basis) / weight_total, 4)
+    return rank_score, rank_basis, rank_components, weights_used
 
 
-def rank_and_sort_watchlist(watchlist):
+def rank_and_sort_watchlist(watchlist, pool):
+    pool_stats = compute_pool_stats(pool, RANK_WEIGHTS.keys())
     for player in watchlist:
-        player["rank_score"], player["rank_basis"], player["rank_components"] = compute_rank(player)
+        rank_score, rank_basis, rank_components, weights_used = compute_rank(player, pool_stats)
+        player["rank_score"] = rank_score
+        player["rank_basis"] = rank_basis
+        player["rank_components"] = rank_components
+        player["weights_used"] = weights_used
     watchlist.sort(key=lambda p: (p["rank_score"] is None, -(p["rank_score"] or 0)))
+    return pool_stats
 
 
 def build_rivals(league_ids, picks_gw, elements):
@@ -247,10 +476,11 @@ def build_rivals(league_ids, picks_gw, elements):
     return rivals
 
 
-def attach_player_stats(records, elements, cache, latest_finished_gw):
+def attach_player_stats(records, elements, cache, latest_finished_gw, histories_out):
     for record in records:
         el = elements[record["player_id"]]
         history = fetch_player_history(record["player_id"], cache, latest_finished_gw)
+        histories_out[record["player_id"]] = history
         record.update(compute_player_stats(history, el["now_cost"] / 10, el["total_points"], record["pos"]))
 
 
@@ -301,16 +531,19 @@ def main():
     watchlist = candidates[:watchlist_size]
 
     cache = load_element_summary_cache()
-    attach_player_stats(my_squad, elements, cache, latest_finished_gw)
-    attach_player_stats(watchlist, elements, cache, latest_finished_gw)
+    histories = {}
+    attach_player_stats(my_squad, elements, cache, latest_finished_gw, histories)
+    attach_player_stats(watchlist, elements, cache, latest_finished_gw, histories)
     save_element_summary_cache(cache)
 
     watched_club_ids = {elements[p["player_id"]]["team"] for p in my_squad + watchlist}
     fixtures_next6 = build_fixtures_next6(fixtures, teams_by_id, watched_club_ids)
 
-    attach_fixture_scores(my_squad, fixtures_next6)
-    attach_fixture_scores(watchlist, fixtures_next6)
-    rank_and_sort_watchlist(watchlist)
+    team_strength = build_team_strength(elements, teams_by_id, histories)
+
+    attach_fixture_scores(my_squad, fixtures_next6, team_strength)
+    attach_fixture_scores(watchlist, fixtures_next6, team_strength)
+    pool_stats = rank_and_sort_watchlist(watchlist, my_squad + watchlist)
 
     rivals = build_rivals(league_ids, picks_gw, elements)
 
@@ -346,7 +579,9 @@ def main():
         "gw": {"current": gw_current, "next": gw_next, "next_deadline": next_deadline},
         "my_squad": my_squad,
         "watchlist": watchlist,
+        "watchlist_rank_stats": pool_stats,
         "fixtures_next6": fixtures_next6,
+        "team_strength": team_strength,
         "rivals": rivals,
         "price_watch": price_watch,
         "bank": bank,
@@ -379,6 +614,18 @@ def main():
     print(json.dumps(sample_watchlist, indent=2))
     print("\nSample under-90-minutes player:")
     print(json.dumps(sample_under90, indent=2))
+
+    print("\nz-score mean/std used (across squad + watchlist):")
+    print(json.dumps(pool_stats, indent=2))
+    print("\nTop 10 watchlist players by rank_score:")
+    for p in watchlist[:10]:
+        print(json.dumps(
+            {k: p[k] for k in (
+                "name", "club", "pos", "rank_score", "rank_basis", "weights_used",
+                "rank_components", "xgi_per90", "minutes_per_app", "fixture_score", "points_per_million",
+            )},
+            indent=2,
+        ))
 
 
 if __name__ == "__main__":
