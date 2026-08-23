@@ -34,24 +34,24 @@ EUROPEAN_RECOVERY_THRESHOLD_DAYS = 4
 # null rather than a technically-true but meaningless figure like 73 days.
 EUROPEAN_MAX_LOOKBACK_DAYS = 14
 
-# Rolling team-strength window, and where the pre-season/early-season prior comes from.
+# Rolling team-strength window, and the prior it blends with early in the season.
 TEAM_STRENGTH_WINDOW = 6
-# Fallback league-average anchors (roughly PL historical norms) used only when there's
-# no rolling data at all yet (e.g. before gameweek 1 has finished) to convert FPL's
-# strength ratings into pseudo-xG units.
-FALLBACK_XG_ANCHOR = 1.3
-FALLBACK_CLEAN_SHEET_ANCHOR = 0.28
+# League-average anchors, in goals per team per match, used to scale FPL's
+# (unitless) team strength ratings into the same units as the rolling figures.
+# Fixed constants on purpose: deriving them from whatever data has arrived so
+# far made every club's prior move whenever the observed sample changed.
+LEAGUE_GOALS_PER_MATCH = {"home": 1.6, "away": 1.3}
+LEAGUE_CLEAN_SHEET_RATE = {"home": 0.32, "away": 0.24}
 
 # Bumping this forces a full cache refetch when the cached schema is missing fields
 # a newer version of this script needs (e.g. the team-strength inputs added later).
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
 
-# Fields kept per gameweek in the cache -- just enough to derive player stats and,
-# aggregated across watched players' clubs, team-strength inputs.
+# Fields kept per gameweek in the cache. Per-player stats only -- team metrics
+# come from the fixture list, not from aggregating these.
 HISTORY_FIELDS = (
-    "round", "fixture", "was_home", "minutes", "starts",
-    "expected_goals", "expected_assists", "expected_goals_conceded",
-    "clean_sheets", "defensive_contribution", "bonus",
+    "round", "minutes", "starts",
+    "expected_goals", "expected_assists", "defensive_contribution", "bonus",
 )
 
 
@@ -219,148 +219,116 @@ def build_fixtures_next6(fixtures, teams_by_id, club_ids):
 
 
 def summarize_match_window(matches):
-    """Average the last TEAM_STRENGTH_WINDOW matches (already filtered to one
-    venue) into per-match rolling figures. None fields, not zero, when empty."""
-    subset = sorted(matches, key=lambda m: m["round"], reverse=True)[:TEAM_STRENGTH_WINDOW]
-    n = len(subset)
-    xg_for_vals = [m["xg_for"] for m in subset]
-    xg_against_vals = [m["xg_against"] for m in subset if m["xg_against"] is not None]
-    cs_vals = [m["clean_sheet"] for m in subset if m["clean_sheet"] is not None]
+    """Average a club's last TEAM_STRENGTH_WINDOW matches at one venue into
+    per-match figures. Each match is one team-level row from the fixture list,
+    so this does not depend on which players we happen to be tracking."""
+    subset = sorted(matches, key=lambda m: m["sort_key"], reverse=True)[:TEAM_STRENGTH_WINDOW]
+    if not subset:
+        return {"goals_for_per_match": None, "goals_against_per_match": None,
+                "clean_sheet_rate": None, "matches_in_window": 0}
     return {
-        "xg_for_per_match": round(statistics.fmean(xg_for_vals), 3) if xg_for_vals else None,
-        "xg_against_per_match": round(statistics.fmean(xg_against_vals), 3) if xg_against_vals else None,
-        "clean_sheet_rate": round(statistics.fmean(cs_vals), 3) if cs_vals else None,
-        "matches_in_window": n,
+        "goals_for_per_match": round(statistics.fmean(m["goals_for"] for m in subset), 3),
+        "goals_against_per_match": round(statistics.fmean(m["goals_against"] for m in subset), 3),
+        "clean_sheet_rate": round(statistics.fmean(1 if m["goals_against"] == 0 else 0 for m in subset), 3),
+        "matches_in_window": len(subset),
     }
 
 
-def build_rolling_team_matches(elements, teams_by_id, histories):
-    """Reconstruct one row per (club, fixture) from the watched players' own
-    element-summary histories. expected_goals is summed across whichever of
-    the club's players we have data for (so it under-counts for clubs with
-    fewer watchlist/squad players -- an inherent limit of not fetching every
-    player on every club); expected_goals_conceded and clean_sheets are
-    team-level values reported identically by every player from that side in
-    that match, so any single sample for a given (club, fixture) is enough."""
-    match_log = {}
-    for player_id, history in histories.items():
-        team_short = teams_by_id[elements[player_id]["team"]]["short_name"]
-        for gw in history:
-            if not gw.get("minutes") or gw.get("fixture") is None:
-                continue
-            key = (team_short, gw["fixture"])
-            entry = match_log.setdefault(
-                key, {"round": gw["round"], "was_home": bool(gw.get("was_home")), "xg_for": 0.0,
-                      "xg_against_samples": [], "clean_sheet_samples": []},
-            )
-            entry["xg_for"] += float(gw.get("expected_goals") or 0)
-            if gw.get("expected_goals_conceded") is not None:
-                entry["xg_against_samples"].append(float(gw["expected_goals_conceded"]))
-            if gw.get("clean_sheets") is not None:
-                entry["clean_sheet_samples"].append(gw["clean_sheets"])
+def build_team_match_log(fixtures, teams_by_id):
+    """One row per club per played match, straight from the fixture list.
 
+    Uses team_h_score rather than the finished flag: FPL leaves finished False
+    for a while after a match ends (it flips finished_provisional first), so
+    keying off finished would discard real results. Nothing here touches player
+    data, so a club's record is unaffected by who is on the watchlist."""
     matches_by_club = defaultdict(list)
-    for (team_short, _fixture_id), entry in match_log.items():
-        matches_by_club[team_short].append(
-            {
-                "round": entry["round"],
-                "was_home": entry["was_home"],
-                "xg_for": round(entry["xg_for"], 3),
-                "xg_against": round(statistics.fmean(entry["xg_against_samples"]), 3)
-                if entry["xg_against_samples"] else None,
-                "clean_sheet": (1 if any(entry["clean_sheet_samples"]) else 0)
-                if entry["clean_sheet_samples"] else None,
-            }
-        )
+    for f in fixtures:
+        home_goals, away_goals = f.get("team_h_score"), f.get("team_a_score")
+        if home_goals is None or away_goals is None:
+            continue
+        sort_key = (f.get("event") or 0, f.get("kickoff_time") or "")
+        for club_id, is_home, scored, conceded in (
+            (f["team_h"], True, home_goals, away_goals),
+            (f["team_a"], False, away_goals, home_goals),
+        ):
+            club = teams_by_id[club_id]["short_name"]
+            matches_by_club[club].append(
+                {"sort_key": sort_key, "was_home": is_home,
+                 "goals_for": scored, "goals_against": conceded}
+            )
     return matches_by_club
 
 
-def compute_league_anchors(rolling_by_club):
-    """Pseudo-xG scale to convert FPL's own (unitless) strength ratings into
-    numbers comparable with our rolling per-match figures. Anchored to
-    whatever rolling data actually exists across the league so far; falls
-    back to fixed historical-average constants pre-season when there's none."""
-    xg_for_pool, xg_against_pool, cs_pool = [], [], []
-    for splits in rolling_by_club.values():
-        for split in splits.values():
-            if split["xg_for_per_match"] is not None:
-                xg_for_pool.append(split["xg_for_per_match"])
-            if split["xg_against_per_match"] is not None:
-                xg_against_pool.append(split["xg_against_per_match"])
-            if split["clean_sheet_rate"] is not None:
-                cs_pool.append(split["clean_sheet_rate"])
-    return {
-        "xg_for_per_match": round(statistics.fmean(xg_for_pool), 3) if xg_for_pool else FALLBACK_XG_ANCHOR,
-        "xg_against_per_match": round(statistics.fmean(xg_against_pool), 3) if xg_against_pool else FALLBACK_XG_ANCHOR,
-        "clean_sheet_rate": round(statistics.fmean(cs_pool), 3) if cs_pool else FALLBACK_CLEAN_SHEET_ANCHOR,
-    }
-
-
 def relative_strength(team_rating, league_mean_rating):
-    """team_rating / league_mean_rating, defined as 1.0 (average) if the
-    league mean is 0 -- FPL occasionally reports every club's strength
-    rating as 0 (e.g. before they're published for a new season)."""
+    """team_rating / league_mean_rating, defined as 1.0 (average) when the
+    league mean is 0, so a season with unpublished ratings degrades to
+    "everyone average" instead of dividing by zero."""
     return team_rating / league_mean_rating if league_mean_rating else 1.0
 
 
-def build_team_strength(elements, teams_by_id, histories):
-    """Rolling last-6 (home/away split) xG-based team strength, blended with
-    FPL's own strength ratings before there's enough rolling data (i.e.
-    before gameweek 7). matches_in_window/6 is the rolling weight; whatever
-    remains -- 1 full season prior to kickoff -- goes to the FPL-rating prior,
-    so a club with zero observed matches falls back to the prior entirely."""
+def build_team_strength(fixtures, teams_by_id):
+    """Team-level strength: rolling last-6 home/away form from actual match
+    results, blended with a prior from FPL's own team strength ratings.
+
+    Deliberately takes no player data. An earlier version summed
+    element-summary xG across the squad+watchlist sample, which made a club's
+    rating depend on how many of its players were being tracked -- swapping one
+    watchlist player moved every club's numbers, including clubs with no
+    tracked players at all.
+
+    The league anchors are fixed constants rather than averages of the
+    observed sample, so the prior cannot drift with whatever data happens to
+    have arrived. Goals, not xG: no free team-level xG source was reachable
+    (understat serves a stub, fbref is Cloudflare-blocked, football-data.co.uk
+    has no 26/27 CSV), and the fields are named for what they actually hold."""
     all_clubs = list(teams_by_id.values())
+    matches_by_club = build_team_match_log(fixtures, teams_by_id)
 
-    rolling_by_club = {}
-    matches_by_club = build_rolling_team_matches(elements, teams_by_id, histories)
-    for team in all_clubs:
-        matches = matches_by_club.get(team["short_name"], [])
-        rolling_by_club[team["short_name"]] = {
-            "home": summarize_match_window([m for m in matches if m["was_home"]]),
-            "away": summarize_match_window([m for m in matches if not m["was_home"]]),
+    rolling_by_club = {
+        team["short_name"]: {
+            "home": summarize_match_window(
+                [m for m in matches_by_club.get(team["short_name"], []) if m["was_home"]]),
+            "away": summarize_match_window(
+                [m for m in matches_by_club.get(team["short_name"], []) if not m["was_home"]]),
         }
+        for team in all_clubs
+    }
 
-    anchors = compute_league_anchors(rolling_by_club)
+    # strength_attack_* and strength_defence_* are 0 for every club in this
+    # season's payload; strength_overall_home/away are the populated ones.
+    # They conflate attack and defence, so the same rating scales both sides of
+    # the prior -- coarse, but real team-level signal rather than none.
     fpl_means = {
-        "attack_home": statistics.fmean(t["strength_attack_home"] for t in all_clubs),
-        "attack_away": statistics.fmean(t["strength_attack_away"] for t in all_clubs),
-        "defence_home": statistics.fmean(t["strength_defence_home"] for t in all_clubs),
-        "defence_away": statistics.fmean(t["strength_defence_away"] for t in all_clubs),
+        venue: statistics.fmean(t[f"strength_overall_{venue}"] or 0 for t in all_clubs)
+        for venue in ("home", "away")
     }
 
     team_strength = {}
     for team in all_clubs:
         short = team["short_name"]
         club_result = {}
-        for venue, attack_key, defence_key in (
-            ("home", "strength_attack_home", "strength_defence_home"),
-            ("away", "strength_attack_away", "strength_defence_away"),
-        ):
+        for venue in ("home", "away"):
             roll = rolling_by_club[short][venue]
             rolling_weight = min(roll["matches_in_window"] / TEAM_STRENGTH_WINDOW, 1.0)
             prior_weight = round(1 - rolling_weight, 3)
 
-            # FPL sometimes reports these ratings as 0 for every club (e.g. before
-            # they're published for a new season) -- fall back to "average" (1.0)
-            # rather than dividing by zero when the league mean itself is 0.
-            relative_attack = relative_strength(team[attack_key], fpl_means[f"attack_{venue}"])
-            relative_defence = relative_strength(team[defence_key], fpl_means[f"defence_{venue}"])
-            prior_xg_for = anchors["xg_for_per_match"] * relative_attack
-            # Stronger defence (higher rating) -> concedes less -> divide, not multiply.
-            prior_xg_against = anchors["xg_against_per_match"] / relative_defence if relative_defence else anchors["xg_against_per_match"]
-            prior_clean_sheet_rate = min(anchors["clean_sheet_rate"] * relative_defence, 1.0)
+            strength = relative_strength(team[f"strength_overall_{venue}"] or 0, fpl_means[venue])
+            anchor_goals = LEAGUE_GOALS_PER_MATCH[venue]
+            anchor_clean_sheet = LEAGUE_CLEAN_SHEET_RATE[venue]
+            prior_goals_for = anchor_goals * strength
+            # A stronger side concedes fewer and keeps more clean sheets.
+            prior_goals_against = anchor_goals / strength if strength else anchor_goals
+            prior_clean_sheet_rate = min(anchor_clean_sheet * strength, 1.0)
 
             def blend(rolling_value, prior_value):
                 observed = rolling_value if rolling_value is not None else prior_value
                 return round(rolling_weight * observed + prior_weight * prior_value, 3)
 
             club_result[venue] = {
-                "xg_for_per_match": blend(roll["xg_for_per_match"], prior_xg_for),
-                "xg_against_per_match": blend(roll["xg_against_per_match"], prior_xg_against),
+                "goals_for_per_match": blend(roll["goals_for_per_match"], prior_goals_for),
+                "goals_against_per_match": blend(roll["goals_against_per_match"], prior_goals_against),
                 "clean_sheet_rate": blend(roll["clean_sheet_rate"], prior_clean_sheet_rate),
-                # Not exposed anywhere in the public FPL API (bootstrap-static and
-                # element-summary have no "big chances" stat) -- always null rather
-                # than fabricated, on both the rolling and the prior side.
+                # No free team-level source exposes big chances; null, not invented.
                 "big_chances_conceded_per_match": None,
                 "matches_in_window": roll["matches_in_window"],
                 "prior_weight": prior_weight,
@@ -373,10 +341,10 @@ def build_team_strength(elements, teams_by_id, histories):
 # and in which direction. Null components (always true for big_chances_conceded_per_match,
 # since the API doesn't expose it) are skipped rather than zeroed.
 FIXTURE_DIFFICULTY_COMPONENTS = {
-    "MID": (("xg_against_per_match", -1.0), ("clean_sheet_rate", 3.0)),
-    "FWD": (("xg_against_per_match", -1.0), ("clean_sheet_rate", 3.0)),
-    "GKP": (("xg_for_per_match", 1.0), ("big_chances_conceded_per_match", 1.0)),
-    "DEF": (("xg_for_per_match", 1.0), ("big_chances_conceded_per_match", 1.0)),
+    "MID": (("goals_against_per_match", -1.0), ("clean_sheet_rate", 3.0)),
+    "FWD": (("goals_against_per_match", -1.0), ("clean_sheet_rate", 3.0)),
+    "GKP": (("goals_for_per_match", 1.0), ("big_chances_conceded_per_match", 1.0)),
+    "DEF": (("goals_for_per_match", 1.0), ("big_chances_conceded_per_match", 1.0)),
 }
 
 
@@ -630,11 +598,10 @@ def build_rivals(league_ids, picks_gw, elements):
     return rivals
 
 
-def attach_player_stats(records, elements, cache, latest_finished_gw, histories_out):
+def attach_player_stats(records, elements, cache, latest_finished_gw):
     for record in records:
         el = elements[record["player_id"]]
         history = fetch_player_history(record["player_id"], cache, latest_finished_gw)
-        histories_out[record["player_id"]] = history
         record.update(compute_player_stats(history, el["now_cost"] / 10, el["total_points"], record["pos"]))
 
 
@@ -685,15 +652,14 @@ def main():
     watchlist = candidates[:watchlist_size]
 
     cache = load_element_summary_cache()
-    histories = {}
-    attach_player_stats(my_squad, elements, cache, latest_finished_gw, histories)
-    attach_player_stats(watchlist, elements, cache, latest_finished_gw, histories)
+    attach_player_stats(my_squad, elements, cache, latest_finished_gw)
+    attach_player_stats(watchlist, elements, cache, latest_finished_gw)
     save_element_summary_cache(cache)
 
     watched_club_ids = {elements[p["player_id"]]["team"] for p in my_squad + watchlist}
     fixtures_next6 = build_fixtures_next6(fixtures, teams_by_id, watched_club_ids)
 
-    team_strength = build_team_strength(elements, teams_by_id, histories)
+    team_strength = build_team_strength(fixtures, teams_by_id)
 
     attach_fixture_scores(my_squad, fixtures_next6, team_strength)
     attach_fixture_scores(watchlist, fixtures_next6, team_strength)
