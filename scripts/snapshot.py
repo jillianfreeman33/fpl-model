@@ -43,8 +43,15 @@ RANK_WEIGHTS = {
     "net_transfers": 0.5,      # market momentum / price-change pressure
     "rival_ownership": 0.5,    # how many of your league rivals already own them
     "ownership": 0.5,          # inverted below: tilt toward differentials
-    "availability": 2.0,       # fitness; 0 excludes the player outright
 }
+
+# Availability is deliberately NOT a z-scored component. Almost every player sits
+# at 1.0, so the standard deviation is tiny and z-scoring turned a 50% doubt into
+# -7 standard deviations -- enough to make one flag outrank every other signal
+# combined. It is applied instead as a bounded, interpretable penalty in score
+# space: a player half likely to feature loses half this many z-units. Players at
+# 0.0 (injured, suspended, unavailable, not in squad) are excluded outright.
+AVAILABILITY_PENALTY = 1.0
 
 # Components whose scale differs by position for reasons unrelated to quality,
 # so they are z-scored WITHIN position. fixture_score/fdr_next3 read opposite
@@ -430,14 +437,18 @@ def build_team_strength(fixtures, teams_by_id, elements):
                 return round(rolling_weight * observed + prior_weight * prior_value, 3)
 
             xg = team_xg.get(short)
+            # xG goes through the SAME prior blend as goals. Left raw it bypassed
+            # the shrinkage entirely: one match of data produced a 0.21-3.91 league
+            # spread, and because FPL's season xG is not split by venue, a club
+            # with no home matches yet showed its away xG under the home key while
+            # goals correctly showed the prior. Blending fixes both -- the season
+            # figure is the observation, shrunk toward each venue's own prior.
             club_result[venue] = {
                 "goals_for_per_match": blend(roll["goals_for_per_match"], prior_goals_for),
                 "goals_against_per_match": blend(roll["goals_against_per_match"], prior_goals_against),
                 "clean_sheet_rate": blend(roll["clean_sheet_rate"], prior_clean_sheet),
-                # Season xG is not split by venue by FPL, so the same club figure
-                # appears under both -- labelled rather than silently duplicated.
-                "xg_for_per_match": xg["xg_for_per_match"] if xg else None,
-                "xg_against_per_match": xg["xg_against_per_match"] if xg else None,
+                "xg_for_per_match": blend(xg["xg_for_per_match"], prior_goals_for) if xg else None,
+                "xg_against_per_match": blend(xg["xg_against_per_match"], prior_goals_against) if xg else None,
                 "big_chances_conceded_per_match": None,
                 "matches_in_window": roll["matches_in_window"],
                 "prior_weight": prior_weight,
@@ -612,7 +623,8 @@ def compute_rank(values, pos, pool_stats):
     Players who cannot play are excluded outright rather than scored, since no
     amount of underlying quality helps a suspended player this gameweek."""
     if values["availability"] == 0.0:
-        return {"rank_score": None, "rank_basis": [], "rank_components": {},
+        return {"rank_score": None, "rank_score_before_availability": None,
+                "availability_penalty": None, "rank_basis": [], "rank_components": {},
                 "weights_used": {}, "rank_coverage": 0.0,
                 "rank_excluded_reason": "unavailable"}
 
@@ -631,12 +643,15 @@ def compute_rank(values, pos, pool_stats):
     coverage = round(sum(weights_used.values()) / total_weight, 3)
 
     if coverage < RANK_MIN_COVERAGE:
-        return {"rank_score": None, "rank_basis": rank_basis, "rank_components": components,
+        return {"rank_score": None, "rank_score_before_availability": None,
+                "availability_penalty": None, "rank_basis": rank_basis, "rank_components": components,
                 "weights_used": weights_used, "rank_coverage": coverage,
                 "rank_excluded_reason": f"insufficient data (coverage {coverage} < {RANK_MIN_COVERAGE})"}
 
     score = sum(RANK_WEIGHTS[n] * z[n] for n in rank_basis) / total_weight
-    return {"rank_score": round(score, 4), "rank_basis": rank_basis, "rank_components": components,
+    penalty = round(AVAILABILITY_PENALTY * (1.0 - values["availability"]), 4)
+    return {"rank_score": round(score - penalty, 4), "rank_score_before_availability": round(score, 4),
+            "availability_penalty": penalty, "rank_basis": rank_basis, "rank_components": components,
             "weights_used": weights_used, "rank_coverage": coverage, "rank_excluded_reason": None}
 
 

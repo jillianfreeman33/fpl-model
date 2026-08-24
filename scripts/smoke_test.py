@@ -185,7 +185,26 @@ def main():
 
     print("\nweights")
     check("all weights positive", all(w > 0 for w in s.RANK_WEIGHTS.values()))
-    check("14 components", len(s.RANK_WEIGHTS) == 14, str(len(s.RANK_WEIGHTS)))
+    check("13 z-scored components", len(s.RANK_WEIGHTS) == 13, str(len(s.RANK_WEIGHTS)))
+    check("availability is not z-scored", "availability" not in s.RANK_WEIGHTS)
+
+    print("\navailability penalty is bounded")
+    pen = [p["availability_penalty"] for p in squad + watch if p.get("availability_penalty") is not None]
+    check("penalty never exceeds AVAILABILITY_PENALTY",
+          all(0.0 <= x <= s.AVAILABILITY_PENALTY for x in pen),
+          f"max={max(pen) if pen else 0}")
+    doubtful = [p for p in squad + watch
+                if p.get("availability") not in (None, 1.0) and p["rank_score"] is not None]
+    check("doubtful players are penalised proportionally",
+          all(abs(p["availability_penalty"] - s.AVAILABILITY_PENALTY * (1 - p["availability"])) < 1e-9
+              for p in doubtful), f"n={len(doubtful)}")
+
+    print("\nxG is blended, not raw")
+    xgs = [ts[c][v]["xg_for_per_match"] for c in ts if not c.startswith("_")
+           for v in ("home", "away") if ts[c][v].get("xg_for_per_match") is not None]
+    check("blended xG sits in a plausible per-match range",
+          all(0.2 <= x <= 3.2 for x in xgs) if xgs else True,
+          f"range {min(xgs):.2f}..{max(xgs):.2f}" if xgs else "no xG")
 
     print("\ntransfer options")
     opts = snap["transfer_options"]
