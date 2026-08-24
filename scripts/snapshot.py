@@ -483,6 +483,27 @@ def fixture_difficulty(pos, opponent_stats):
     return round(sum(terms), 3) if terms else None
 
 
+def compute_fixture_score(club_fixtures, count, pos, team_strength):
+    """Total difficulty of a club's next `count` fixtures for one position."""
+    total, counted = 0.0, 0
+    for f in club_fixtures[:count]:
+        # Face the opponent at the venue they will actually be playing:
+        # if we are home, they are away, and vice versa.
+        opponent_venue = "away" if f["is_home"] else "home"
+        difficulty = fixture_difficulty(pos, team_strength.get(f["opponent"], {}).get(opponent_venue))
+        if difficulty is not None:
+            total += difficulty
+            counted += 1
+    return round(total, 3) if counted else None
+
+
+def attach_fixture_scores(records, fixtures_next6, team_strength):
+    for record in records:
+        club_fixtures = fixtures_next6.get(record["club"], [])
+        record["fixture_score"] = compute_fixture_score(club_fixtures, 6, record["pos"], team_strength)
+        record["fdr_next3"] = compute_fixture_score(club_fixtures, 3, record["pos"], team_strength)
+
+
 def compute_pool_stats(pool, component_names, position_relative):
     """Mean/population-stdev per component across the ranking pool.
 
