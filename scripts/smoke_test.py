@@ -185,7 +185,7 @@ def main():
 
     print("\nweights")
     check("all weights positive", all(w > 0 for w in s.RANK_WEIGHTS.values()))
-    check("13 z-scored components", len(s.RANK_WEIGHTS) == 13, str(len(s.RANK_WEIGHTS)))
+    check("14 z-scored components", len(s.RANK_WEIGHTS) == 14, str(len(s.RANK_WEIGHTS)))
     check("availability is not z-scored", "availability" not in s.RANK_WEIGHTS)
 
     print("\navailability penalty is bounded")
@@ -205,6 +205,37 @@ def main():
     check("blended xG sits in a plausible per-match range",
           all(0.2 <= x <= 3.2 for x in xgs) if xgs else True,
           f"range {min(xgs):.2f}..{max(xgs):.2f}" if xgs else "no xG")
+
+    print("\nwatchlist selection is merit-based")
+    sel = snap["watchlist_selection"]
+    check("selection method recorded", sel.get("method") == "merit_preselect", str(sel.get("method")))
+    check("ownership is not a selection weight", "ownership" not in sel["weights"])
+    check("unavailable never selected",
+          all(p["status"] not in ("i", "s", "u", "n") for p in watch),
+          f"rejected {sel['rejected']['unavailable']} unavailable")
+    check("zero-minute players never selected",
+          all((p["minutes_total"] or 0) > 0 for p in watch),
+          f"rejected {sel['rejected']['no_minutes']} with no minutes")
+    check("every selected player has a preselect_score",
+          all(p.get("preselect_score") is not None for p in watch))
+    check("selection is ordered by preselect_score",
+          all(p["preselect_score"] >= sel["cutoff_preselect_score"] for p in watch))
+    owns = [p["ownership"] for p in watch]
+    check("pool is no longer an ownership prefix",
+          min(owns) < 4.0 or len({round(o) for o in owns}) > 5,
+          f"ownership {min(owns)}..{max(owns)}")
+
+    print("\nper-league ownership")
+    lo = [p for p in squad + watch if p.get("league_ownership")]
+    check("every player carries per-league ownership", len(lo) == len(squad + watch))
+    sample = lo[0]["league_ownership"]
+    check("each league reports its own denominator",
+          all(set(v) == {"owned_by", "of", "share"} for v in sample.values()), str(sample))
+    check("shares are within 0..1",
+          all(0.0 <= v["share"] <= 1.0 for p in lo for v in p["league_ownership"].values()
+              if v["share"] is not None))
+    check("overall rival_ownership still present",
+          all(p.get("rival_ownership") is not None for p in lo))
 
     print("\ntransfer options")
     opts = snap["transfer_options"]

@@ -35,6 +35,7 @@ RANK_WEIGHTS = {
     "starts_rate": 1.5,        # started vs came off the bench
     "fixture_score": 2.0,      # opponent difficulty, next 6
     "fdr_next3": 1.0,          # opponent difficulty, next 3 (transfer horizon)
+    "fdr_next1": 0.5,          # opponent difficulty, the very next game
     "points_per_million": 1.0, # value for money
     "form": 1.5,               # FPL's own recent-points form
     "defcon_per90": 1.0,       # defensive contribution volume
@@ -57,17 +58,42 @@ AVAILABILITY_PENALTY = 1.0
 # so they are z-scored WITHIN position. fixture_score/fdr_next3 read opposite
 # sides of the opponent (attack for GKP/DEF, defence for MID/FWD) and land in
 # disjoint ranges; DefCon thresholds differ by position by rule.
-POSITION_RELATIVE_COMPONENTS = {"fixture_score", "fdr_next3", "defcon_per90", "defcon_hit_rate"}
+POSITION_RELATIVE_COMPONENTS = {"fixture_score", "fdr_next3", "fdr_next1",
+                                "defcon_per90", "defcon_hit_rate"}
 
 # Components where a lower raw value is better, so their z is negated. Kept
 # separate from the weights so every weight stays positive -- a negative weight
 # would corrupt both the denominator and the coverage fraction.
-LOWER_IS_BETTER = {"fixture_score", "fdr_next3", "ownership"}
+LOWER_IS_BETTER = {"fixture_score", "fdr_next3", "fdr_next1", "ownership"}
 
 # Refuse to rank a player carrying less than this share of the total weight in
 # actual data -- below it the score says more about what is missing than about
 # the player.
 RANK_MIN_COVERAGE = 0.45
+
+# Which of the ~700 players get considered at all. Everything here comes from
+# bootstrap-static plus the fixture list, so the whole pool can be scored before
+# a single element-summary call is made.
+#
+# Ownership is deliberately absent. It is a scoring component with an inverted
+# sign (differential tilt), so selecting the most-owned players and then
+# rewarding low ownership inside that pool rewards the least-owned of the
+# most-owned -- incoherent, and the cause of the template bias. Ownership still
+# feeds rank_score; it just no longer decides who is eligible.
+PRESELECT_WEIGHTS = {
+    "xgi_per90": 2.0,               # attacking output, from bootstrap season totals
+    "form": 1.5,                    # FPL's own recent-points form
+    "points_per_million": 1.5,      # value
+    "minutes": 1.5,                 # is this player actually playing
+    "fixture_ease_next3": 1.5,      # transfer horizon
+    "fixture_ease_next1": 0.5,      # the very next game
+}
+# Fixture ease differs in scale by position (GKP/DEF read the opponent's attack,
+# MID/FWD their defence), so it is z-scored within position, as in rank_score.
+PRESELECT_POSITION_RELATIVE = {"fixture_ease_next3", "fixture_ease_next1"}
+# Never consider a player who cannot play, or who has not played at all -- 17 of
+# 60 slots were going to such players under the old ownership sort.
+PRESELECT_REQUIRE_MINUTES = True
 
 # A European tie this many calendar days or fewer before a league kickoff is flagged.
 EUROPEAN_RECOVERY_THRESHOLD_DAYS = 4
@@ -495,7 +521,13 @@ def fixture_difficulty(pos, opponent_stats):
 
 
 def compute_fixture_score(club_fixtures, count, pos, team_strength):
-    """Total difficulty of a club's next `count` fixtures for one position."""
+    """Mean opponent difficulty over a club's next `count` fixtures.
+
+    A mean rather than a sum: with a blank gameweek a club has fewer upcoming
+    fixtures, and summing would score it as though its remaining games were
+    easier. Averaging compares like with like. (Where every club has the full
+    count the two are a monotonic transform of each other, so the z-scores are
+    unchanged.)"""
     total, counted = 0.0, 0
     for f in club_fixtures[:count]:
         # Face the opponent at the venue they will actually be playing:
@@ -505,14 +537,102 @@ def compute_fixture_score(club_fixtures, count, pos, team_strength):
         if difficulty is not None:
             total += difficulty
             counted += 1
-    return round(total, 3) if counted else None
+    return round(total / counted, 3) if counted else None
 
 
 def attach_fixture_scores(records, fixtures_next6, team_strength):
     for record in records:
         club_fixtures = fixtures_next6.get(record["club"], [])
-        record["fixture_score"] = compute_fixture_score(club_fixtures, 6, record["pos"], team_strength)
-        record["fdr_next3"] = compute_fixture_score(club_fixtures, 3, record["pos"], team_strength)
+        for field, horizon in (("fixture_score", 6), ("fdr_next3", 3), ("fdr_next1", 1)):
+            record[field] = compute_fixture_score(club_fixtures, horizon, record["pos"], team_strength)
+
+
+def bootstrap_xgi_per90(el):
+    """xGI per 90 straight from bootstrap season totals.
+
+    Available for every player in the league without an element-summary call,
+    which is what makes merit-based preselection possible at all. Guarded at 90
+    minutes for the same reason the per-player stats are: below that it is a
+    rate extrapolated from almost nothing."""
+    minutes = el.get("minutes") or 0
+    if minutes < 90:
+        return None
+    xg = el.get("expected_goals")
+    xa = el.get("expected_assists")
+    if xg is None and xa is None:
+        return None
+    total = float(xg or 0) + float(xa or 0)
+    return round(total / (minutes / 90), 3)
+
+
+def build_watchlist(elements, teams_by_id, types_by_id, my_ids, empty_stats,
+                    fixtures_next6, team_strength, watchlist_size):
+    """Choose the candidate pool on merit rather than popularity.
+
+    The previous version sorted every unowned player by ownership descending and
+    kept the top 60, with form as a tiebreak that only bit when two players
+    shared an ownership figure. That made the 14-component model a ranker of a
+    pool chosen by popularity alone: it selected 25 defenders to 8 forwards by
+    accident, 11 players from one club, three who were unavailable and fourteen
+    with zero minutes -- and it capped visibility at 4.3% ownership, so an
+    equally good player one decimal lower was never seen.
+
+    Selection now scores the whole league on bootstrap-derived merit plus
+    fixture ease, after dropping players who cannot play or have not played."""
+    eligible, rejected = [], {"unavailable": 0, "no_minutes": 0, "owned": 0}
+    for pid, el in elements.items():
+        if pid in my_ids:
+            rejected["owned"] += 1
+            continue
+        record = player_record(el, teams_by_id, types_by_id, empty_stats)
+        if availability(record) == 0.0:
+            rejected["unavailable"] += 1
+            continue
+        if PRESELECT_REQUIRE_MINUTES and not (el.get("minutes") or 0):
+            rejected["no_minutes"] += 1
+            continue
+        club_fixtures = fixtures_next6.get(record["club"], [])
+        eligible.append((record, {
+            "xgi_per90": bootstrap_xgi_per90(el),
+            "form": record["form"],
+            "points_per_million": record["points_per_million"],
+            "minutes": el.get("minutes") or 0,
+            # Negated: a low difficulty number is an easy fixture, and every
+            # preselect component is "higher is better".
+            "fixture_ease_next3": _negate(compute_fixture_score(club_fixtures, 3, record["pos"], team_strength)),
+            "fixture_ease_next1": _negate(compute_fixture_score(club_fixtures, 1, record["pos"], team_strength)),
+            "pos": record["pos"],
+        }))
+
+    inputs = [values for _, values in eligible]
+    stats = compute_pool_stats(inputs, PRESELECT_WEIGHTS.keys(), PRESELECT_POSITION_RELATIVE)
+    total_weight = sum(PRESELECT_WEIGHTS.values())
+    for record, values in eligible:
+        contributions = {}
+        for name, weight in PRESELECT_WEIGHTS.items():
+            z = zscore(values[name], lookup_stats(stats, name, values["pos"], PRESELECT_POSITION_RELATIVE))
+            contributions[name] = None if z is None else round(z, 4)
+        # Missing components count as pool-average, the same shrinkage rank_score uses.
+        record["preselect_score"] = round(
+            sum(PRESELECT_WEIGHTS[n] * (contributions[n] or 0.0) for n in PRESELECT_WEIGHTS) / total_weight, 4)
+        record["preselect_components"] = contributions
+
+    eligible.sort(key=lambda pair: -pair[0]["preselect_score"])
+    watchlist = [record for record, _ in eligible[:watchlist_size]]
+    selection = {
+        "method": "merit_preselect",
+        "weights": PRESELECT_WEIGHTS,
+        "requires_minutes": PRESELECT_REQUIRE_MINUTES,
+        "considered": len(eligible),
+        "selected": len(watchlist),
+        "rejected": rejected,
+        "cutoff_preselect_score": watchlist[-1]["preselect_score"] if watchlist else None,
+    }
+    return watchlist, selection
+
+
+def _negate(value):
+    return None if value is None else -value
 
 
 def compute_pool_stats(pool, component_names, position_relative):
@@ -590,6 +710,7 @@ def derive_rank_inputs(player):
         "starts_rate": round(player["starts"] / apps, 3) if apps and player.get("starts") is not None else None,
         "fixture_score": player.get("fixture_score"),
         "fdr_next3": player.get("fdr_next3"),
+        "fdr_next1": player.get("fdr_next1"),
         "points_per_million": player.get("points_per_million"),
         "form": player.get("form"),
         "defcon_per90": player.get("defcon_per90"),
@@ -812,59 +933,76 @@ def warn_european_calendar_stale(european_clubs, european_by_club, fixtures_next
 
 
 def build_rivals(league_ids, picks_gw, elements):
-    rivals = {}
+    """Top 20 per league, with each rival's picks.
+
+    Also returns picks per league as element IDs. IDs rather than web_names:
+    names are not unique in this league (there are two Palmers), and the old
+    name-matching counter credited every match, overstating ownership."""
+    rivals, picks_by_league = {}, {}
     for league_id in league_ids:
         standings = get(f"leagues-classic/{league_id}/standings/")
         results = standings["standings"]["results"][:20]
-        league_rivals = []
+        league_rivals, league_picks = [], []
         for r in results:
             rival_entry_id = r["entry"]
             try:
-                rival_picks_resp = get(f"entry/{rival_entry_id}/event/{picks_gw}/picks/")
-                rival_picks = [elements[p["element"]]["web_name"] for p in rival_picks_resp["picks"]]
+                resp = get(f"entry/{rival_entry_id}/event/{picks_gw}/picks/")
+                pick_ids = [p["element"] for p in resp["picks"]]
             except requests.RequestException:
-                rival_picks = []
-            league_rivals.append(
-                {
-                    "entry_id": rival_entry_id,
-                    "name": r["player_name"],
-                    "total": r["total"],
-                    "picks": rival_picks,
-                }
-            )
+                pick_ids = []
+            league_picks.append({"entry_id": rival_entry_id, "ids": set(pick_ids)})
+            league_rivals.append({
+                "entry_id": rival_entry_id,
+                "name": r["player_name"],
+                "total": r["total"],
+                "picks": [elements[pid]["web_name"] for pid in pick_ids if pid in elements],
+            })
             time.sleep(0.1)
         rivals[str(league_id)] = league_rivals
-    return rivals
+        picks_by_league[str(league_id)] = league_picks
+    return rivals, picks_by_league
 
 
-def count_rival_ownership(rivals, elements):
-    """How many league rivals own each player, by player_id.
+def compute_league_ownership(picks_by_league):
+    """Ownership share per league, plus a deduplicated overall share.
 
-    rivals[] was previously display-only. Counting it turns the standings into a
-    scoring signal: a player half your league already owns protects your rank
-    less than an equally good player none of them have."""
-    name_to_ids = defaultdict(list)
-    for pid, el in elements.items():
-        name_to_ids[el["web_name"]].append(pid)
-    counts = defaultdict(int)
-    seen_entries = set()
-    for league_rivals in rivals.values():
-        for rival in league_rivals:
-            if rival["entry_id"] in seen_entries:
-                continue  # a rival in both leagues must not be counted twice
-            seen_entries.add(rival["entry_id"])
-            for pick_name in set(rival.get("picks") or []):
-                # Ambiguous web_names are rare; credit every match rather than guess.
-                for pid in name_to_ids.get(pick_name, []):
-                    counts[pid] += 1
-    return counts, len(seen_entries)
+    Per-league matters for transfer decisions in a way the aggregate hides: a
+    player owned by half of one mini-league and nobody in the other is a very
+    different proposition depending on which title is in play. Each entry keeps
+    its own denominator, since the leagues differ in size and only the top 20
+    of each is fetched."""
+    per_league, overall = {}, defaultdict(int)
+    for league_id, squads in picks_by_league.items():
+        counts = defaultdict(int)
+        for squad in squads:
+            for pid in squad["ids"]:
+                counts[pid] += 1
+        per_league[league_id] = {"counts": counts, "of": len(squads)}
+
+    # A rival appearing in both leagues is one manager, counted once overall.
+    seen = set()
+    for squads in picks_by_league.values():
+        for squad in squads:
+            if squad["entry_id"] in seen:
+                continue
+            seen.add(squad["entry_id"])
+            for pid in squad["ids"]:
+                overall[pid] += 1
+    return per_league, overall, len(seen)
 
 
-def attach_rival_ownership(records, counts, rival_total):
+def attach_league_ownership(records, per_league, overall, overall_total):
     for record in records:
-        record["rival_ownership"] = (
-            round(counts.get(record["player_id"], 0) / rival_total, 3) if rival_total else None
-        )
+        pid = record["player_id"]
+        record["league_ownership"] = {
+            league_id: {
+                "owned_by": data["counts"].get(pid, 0),
+                "of": data["of"],
+                "share": round(data["counts"].get(pid, 0) / data["of"], 3) if data["of"] else None,
+            }
+            for league_id, data in per_league.items()
+        }
+        record["rival_ownership"] = round(overall.get(pid, 0) / overall_total, 3) if overall_total else None
 
 
 def build_transfer_options(my_squad, watchlist, bank, free_transfers):
@@ -942,37 +1080,36 @@ def main():
         "minutes_total": None, "minutes_per_app": None, "starts": None, "apps": None,
         "xg_per90": None, "xa_per90": None, "xgi_per90": None, "defcon_per90": None,
         "defcon_hit_rate": None, "points_per_million": None, "bonus_total": None,
-        "fixture_score": None, "fdr_next3": None, "rival_ownership": None,
+        "fixture_score": None, "fdr_next3": None, "fdr_next1": None,
+        "rival_ownership": None, "league_ownership": None,
     }
     my_squad = [
         player_record(elements[pid], teams_by_id, types_by_id, empty_stats)
         for pid in (p["element"] for p in my_picks)
     ]
 
-    candidates = [
-        player_record(el, teams_by_id, types_by_id, empty_stats) for pid, el in elements.items() if pid not in my_ids
-    ]
-    candidates.sort(key=lambda p: (p["ownership"], p["form"]), reverse=True)
-    watchlist = candidates[:watchlist_size]
+    # Neither depends on which players we track, so both can precede selection
+    # -- which is what lets the candidate pool be chosen on fixture-aware merit.
+    team_strength = build_team_strength(fixtures, teams_by_id, elements)
+    fixtures_next6 = build_fixtures_next6(fixtures, teams_by_id, list(teams_by_id))
+
+    watchlist, watchlist_selection = build_watchlist(
+        elements, teams_by_id, types_by_id, my_ids, empty_stats,
+        fixtures_next6, team_strength, watchlist_size)
 
     cache = load_element_summary_cache()
     attach_player_stats(my_squad, elements, cache, latest_finished_gw)
     attach_player_stats(watchlist, elements, cache, latest_finished_gw)
     save_element_summary_cache(cache)
 
-    watched_club_ids = {elements[p["player_id"]]["team"] for p in my_squad + watchlist}
-    fixtures_next6 = build_fixtures_next6(fixtures, teams_by_id, watched_club_ids)
-
-    team_strength = build_team_strength(fixtures, teams_by_id, elements)
-
     attach_fixture_scores(my_squad, fixtures_next6, team_strength)
     attach_fixture_scores(watchlist, fixtures_next6, team_strength)
 
     # Rivals feed rank_ownership, so they must be fetched before ranking.
-    rivals = build_rivals(league_ids, picks_gw, elements)
-    rival_counts, rival_total = count_rival_ownership(rivals, elements)
-    attach_rival_ownership(my_squad, rival_counts, rival_total)
-    attach_rival_ownership(watchlist, rival_counts, rival_total)
+    rivals, picks_by_league = build_rivals(league_ids, picks_gw, elements)
+    per_league, overall_counts, overall_total = compute_league_ownership(picks_by_league)
+    attach_league_ownership(my_squad, per_league, overall_counts, overall_total)
+    attach_league_ownership(watchlist, per_league, overall_counts, overall_total)
 
     # Squad and watchlist are scored against the same distribution, so a player
     # you own is directly comparable with a transfer target.
@@ -1011,6 +1148,7 @@ def main():
         "my_squad": my_squad,
         "watchlist": watchlist,
         "watchlist_rank_stats": pool_stats,
+        "watchlist_selection": watchlist_selection,
         "rank_weights": RANK_WEIGHTS,
         "transfer_options": transfer_options,
         "fixtures_next6": fixtures_next6,
