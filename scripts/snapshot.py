@@ -24,8 +24,43 @@ ELEMENT_SUMMARY_SLEEP_SECONDS = 0.2
 # DefCon 2pt threshold: 10 CBIT for defenders/keepers, 12 CBIRT for mids/forwards.
 DEFCON_THRESHOLD_BY_POS = {"GKP": 10, "DEF": 10, "MID": 12, "FWD": 12}
 
-# rank_score weights, applied to z-scores (fixture_score's z is negated: lower FDR-proxy is better).
-RANK_WEIGHTS = {"xgi_per90": 3, "minutes_per_app": 2, "fixture_score": 2, "points_per_million": 1}
+# rank_score weights, applied to component z-scores. Every quantity the snapshot
+# derives feeds the model through exactly one of these, so nothing is counted
+# twice: xg_per90 + xa_per90 are exactly xgi_per90; price enters via
+# points_per_million; apps enters via starts_rate and bonus_per90. selling_price
+# is a verbatim copy of price and carries no independent signal.
+RANK_WEIGHTS = {
+    "xgi_per90": 3.0,          # attacking output (xG + xA per 90)
+    "minutes_per_app": 2.0,    # how long they last when they play
+    "starts_rate": 1.5,        # started vs came off the bench
+    "fixture_score": 2.0,      # opponent difficulty, next 6
+    "fdr_next3": 1.0,          # opponent difficulty, next 3 (transfer horizon)
+    "points_per_million": 1.0, # value for money
+    "form": 1.5,               # FPL's own recent-points form
+    "defcon_per90": 1.0,       # defensive contribution volume
+    "defcon_hit_rate": 0.5,    # share of appearances hitting the DefCon threshold
+    "bonus_per90": 1.0,        # bonus point accrual
+    "net_transfers": 0.5,      # market momentum / price-change pressure
+    "rival_ownership": 0.5,    # how many of your league rivals already own them
+    "ownership": 0.5,          # inverted below: tilt toward differentials
+    "availability": 2.0,       # fitness; 0 excludes the player outright
+}
+
+# Components whose scale differs by position for reasons unrelated to quality,
+# so they are z-scored WITHIN position. fixture_score/fdr_next3 read opposite
+# sides of the opponent (attack for GKP/DEF, defence for MID/FWD) and land in
+# disjoint ranges; DefCon thresholds differ by position by rule.
+POSITION_RELATIVE_COMPONENTS = {"fixture_score", "fdr_next3", "defcon_per90", "defcon_hit_rate"}
+
+# Components where a lower raw value is better, so their z is negated. Kept
+# separate from the weights so every weight stays positive -- a negative weight
+# would corrupt both the denominator and the coverage fraction.
+LOWER_IS_BETTER = {"fixture_score", "fdr_next3", "ownership"}
+
+# Refuse to rank a player carrying less than this share of the total weight in
+# actual data -- below it the score says more about what is missing than about
+# the player.
+RANK_MIN_COVERAGE = 0.45
 
 # A European tie this many calendar days or fewer before a league kickoff is flagged.
 EUROPEAN_RECOVERY_THRESHOLD_DAYS = 4
@@ -36,12 +71,10 @@ EUROPEAN_MAX_LOOKBACK_DAYS = 14
 
 # Rolling team-strength window, and the prior it blends with early in the season.
 TEAM_STRENGTH_WINDOW = 6
-# League-average anchors, in goals per team per match, used to scale FPL's
-# (unitless) team strength ratings into the same units as the rolling figures.
-# Fixed constants on purpose: deriving them from whatever data has arrived so
-# far made every club's prior move whenever the observed sample changed.
-LEAGUE_GOALS_PER_MATCH = {"home": 1.6, "away": 1.3}
-LEAGUE_CLEAN_SHEET_RATE = {"home": 0.32, "away": 0.24}
+# League anchors are MEASURED from this season's played fixtures, never guessed.
+# They are computed league-wide (every club, both venues), so they depend on real
+# results only -- not on which players are being tracked. With few matches played
+# they are noisy but honest; measured_from_matches is reported in the snapshot.
 
 # Bumping this forces a full cache refetch when the cached schema is missing fields
 # a newer version of this script needs (e.g. the team-strength inputs added later).
@@ -161,6 +194,10 @@ def player_record(el, teams_by_id, types_by_id, player_stats):
         "status": el["status"],
         "chance_of_playing": el.get("chance_of_playing_next_round"),
         "form": float(el["form"]),
+        # Market momentum, previously computed for the squad only (price_watch).
+        "transfers_in_event": el.get("transfers_in_event", 0),
+        "transfers_out_event": el.get("transfers_out_event", 0),
+        "net_transfers": el.get("transfers_in_event", 0) - el.get("transfers_out_event", 0),
     }
     record.update(player_stats)
     return record
@@ -259,6 +296,67 @@ def build_team_match_log(fixtures, teams_by_id):
     return matches_by_club
 
 
+def measure_league_anchors(matches_by_club):
+    """League-average goals and clean sheet rate per venue, MEASURED from every
+    played match this season rather than asserted as constants. Returns None
+    per venue when nothing has been played there yet -- pre-season we genuinely
+    do not know, and inventing a number is what this replaces."""
+    anchors = {}
+    total = 0
+    for venue, want_home in (("home", True), ("away", False)):
+        rows = [m for rows_ in matches_by_club.values() for m in rows_ if m["was_home"] == want_home]
+        total += len(rows)
+        anchors[venue] = None if not rows else {
+            "goals_per_match": round(statistics.fmean(m["goals_for"] for m in rows), 4),
+            "clean_sheet_rate": round(statistics.fmean(1 if m["goals_against"] == 0 else 0 for m in rows), 4),
+            "matches": len(rows),
+        }
+    anchors["measured_from_matches"] = total
+    return anchors
+
+
+def build_team_xg(elements, teams_by_id, matches_by_club):
+    """Real team xG for and against, per club per match.
+
+    FPL publishes no team-level xG endpoint, so this sums bootstrap-static's
+    season xG totals over EVERY player at the club -- the complete population,
+    not a sample, which makes the sum arithmetically the team total. That is the
+    distinction from the version this replaces, which summed a 75-player
+    watchlist sample and therefore measured squad coverage as much as team
+    quality.
+
+    xG against is published per player as the xG their team faced while they
+    were on the pitch, so summing it across a squad counts each team-minute
+    about eleven times over; dividing by the squad's own 90s recovers the team
+    rate exactly, without assuming eleven outfield players.
+
+    Returns None per club when the club has no xG fields or no played matches,
+    so callers fall back to goals rather than to a fabricated figure."""
+    totals = defaultdict(lambda: {"xg": 0.0, "xgc": 0.0, "minutes": 0, "has_fields": False})
+    for el in elements.values():
+        club = teams_by_id[el["team"]]["short_name"]
+        row = totals[club]
+        if el.get("expected_goals") is not None:
+            row["has_fields"] = True
+            row["xg"] += float(el.get("expected_goals") or 0)
+        if el.get("expected_goals_conceded") is not None:
+            row["xgc"] += float(el.get("expected_goals_conceded") or 0)
+        row["minutes"] += el.get("minutes") or 0
+
+    team_xg = {}
+    for club, row in totals.items():
+        played = len(matches_by_club.get(club, []))
+        nineties = row["minutes"] / 90
+        if not row["has_fields"] or played == 0 or nineties == 0:
+            team_xg[club] = None
+            continue
+        team_xg[club] = {
+            "xg_for_per_match": round(row["xg"] / played, 3),
+            "xg_against_per_match": round(row["xgc"] / nineties, 3),
+        }
+    return team_xg
+
+
 def relative_strength(team_rating, league_mean_rating):
     """team_rating / league_mean_rating, defined as 1.0 (average) when the
     league mean is 0, so a season with unpublished ratings degrades to
@@ -266,23 +364,22 @@ def relative_strength(team_rating, league_mean_rating):
     return team_rating / league_mean_rating if league_mean_rating else 1.0
 
 
-def build_team_strength(fixtures, teams_by_id):
-    """Team-level strength: rolling last-6 home/away form from actual match
-    results, blended with a prior from FPL's own team strength ratings.
+def build_team_strength(fixtures, teams_by_id, elements):
+    """Team-level strength: rolling last-6 home/away form blended with a prior
+    from FPL's own team strength ratings.
 
-    Deliberately takes no player data. An earlier version summed
-    element-summary xG across the squad+watchlist sample, which made a club's
-    rating depend on how many of its players were being tracked -- swapping one
-    watchlist player moved every club's numbers, including clubs with no
-    tracked players at all.
+    Takes no player *sample*. Rolling form comes from the fixture list; xG comes
+    from summing every player at a club (the full population -- see
+    build_team_xg), so no club's rating depends on who is on the watchlist.
 
-    The league anchors are fixed constants rather than averages of the
-    observed sample, so the prior cannot drift with whatever data happens to
-    have arrived. Goals, not xG: no free team-level xG source was reachable
-    (understat serves a stub, fbref is Cloudflare-blocked, football-data.co.uk
-    has no 26/27 CSV), and the fields are named for what they actually hold."""
+    Attacking and defensive quality are reported as both xG and goals. xG is
+    the better predictor and is used by fixture_score when available; goals are
+    kept alongside so the two can be compared, and are the fallback when FPL
+    publishes no xG."""
     all_clubs = list(teams_by_id.values())
     matches_by_club = build_team_match_log(fixtures, teams_by_id)
+    anchors = measure_league_anchors(matches_by_club)
+    team_xg = build_team_xg(elements, teams_by_id, matches_by_club)
 
     rolling_by_club = {
         team["short_name"]: {
@@ -295,9 +392,9 @@ def build_team_strength(fixtures, teams_by_id):
     }
 
     # strength_attack_* and strength_defence_* are 0 for every club in this
-    # season's payload; strength_overall_home/away are the populated ones.
-    # They conflate attack and defence, so the same rating scales both sides of
-    # the prior -- coarse, but real team-level signal rather than none.
+    # season's payload; strength_overall_home/away are the populated ones. They
+    # conflate attack and defence, so the same rating scales both sides of the
+    # prior -- coarse, but real team-level signal rather than none.
     fpl_means = {
         venue: statistics.fmean(t[f"strength_overall_{venue}"] or 0 for t in all_clubs)
         for venue in ("home", "away")
@@ -311,85 +408,114 @@ def build_team_strength(fixtures, teams_by_id):
             roll = rolling_by_club[short][venue]
             rolling_weight = min(roll["matches_in_window"] / TEAM_STRENGTH_WINDOW, 1.0)
             prior_weight = round(1 - rolling_weight, 3)
-
             strength = relative_strength(team[f"strength_overall_{venue}"] or 0, fpl_means[venue])
-            anchor_goals = LEAGUE_GOALS_PER_MATCH[venue]
-            anchor_clean_sheet = LEAGUE_CLEAN_SHEET_RATE[venue]
-            prior_goals_for = anchor_goals * strength
-            # A stronger side concedes fewer and keeps more clean sheets.
-            prior_goals_against = anchor_goals / strength if strength else anchor_goals
-            prior_clean_sheet_rate = min(anchor_clean_sheet * strength, 1.0)
+            anchor = anchors[venue]
+
+            if anchor is None:
+                # Nothing played at this venue league-wide: no measured scale exists.
+                club_result[venue] = {
+                    "goals_for_per_match": None, "goals_against_per_match": None,
+                    "clean_sheet_rate": None, "xg_for_per_match": None,
+                    "xg_against_per_match": None, "big_chances_conceded_per_match": None,
+                    "matches_in_window": roll["matches_in_window"], "prior_weight": prior_weight,
+                }
+                continue
+
+            prior_goals_for = anchor["goals_per_match"] * strength
+            prior_goals_against = anchor["goals_per_match"] / strength if strength else anchor["goals_per_match"]
+            prior_clean_sheet = min(anchor["clean_sheet_rate"] * strength, 1.0)
 
             def blend(rolling_value, prior_value):
                 observed = rolling_value if rolling_value is not None else prior_value
                 return round(rolling_weight * observed + prior_weight * prior_value, 3)
 
+            xg = team_xg.get(short)
             club_result[venue] = {
                 "goals_for_per_match": blend(roll["goals_for_per_match"], prior_goals_for),
                 "goals_against_per_match": blend(roll["goals_against_per_match"], prior_goals_against),
-                "clean_sheet_rate": blend(roll["clean_sheet_rate"], prior_clean_sheet_rate),
-                # No free team-level source exposes big chances; null, not invented.
+                "clean_sheet_rate": blend(roll["clean_sheet_rate"], prior_clean_sheet),
+                # Season xG is not split by venue by FPL, so the same club figure
+                # appears under both -- labelled rather than silently duplicated.
+                "xg_for_per_match": xg["xg_for_per_match"] if xg else None,
+                "xg_against_per_match": xg["xg_against_per_match"] if xg else None,
                 "big_chances_conceded_per_match": None,
                 "matches_in_window": roll["matches_in_window"],
                 "prior_weight": prior_weight,
             }
         team_strength[short] = club_result
+    team_strength["_league_anchors"] = anchors
+    team_strength["_xg_available"] = any(v is not None for v in team_xg.values())
     return team_strength
 
 
-# Per position group, which opponent team_strength fields drive fixture difficulty,
-# and in which direction. Null components (always true for big_chances_conceded_per_match,
-# since the API doesn't expose it) are skipped rather than zeroed.
+# Per position group, which opponent fields drive fixture difficulty and in which
+# direction. xG variants are preferred when FPL publishes them and fall back to
+# goals otherwise -- fixture_difficulty tries each pair in order.
 FIXTURE_DIFFICULTY_COMPONENTS = {
-    "MID": (("goals_against_per_match", -1.0), ("clean_sheet_rate", 3.0)),
-    "FWD": (("goals_against_per_match", -1.0), ("clean_sheet_rate", 3.0)),
-    "GKP": (("goals_for_per_match", 1.0), ("big_chances_conceded_per_match", 1.0)),
-    "DEF": (("goals_for_per_match", 1.0), ("big_chances_conceded_per_match", 1.0)),
+    "MID": ((("xg_against_per_match", "goals_against_per_match"), -1.0),
+            (("clean_sheet_rate", None), 3.0)),
+    "FWD": ((("xg_against_per_match", "goals_against_per_match"), -1.0),
+            (("clean_sheet_rate", None), 3.0)),
+    "GKP": ((("xg_for_per_match", "goals_for_per_match"), 1.0),
+            (("big_chances_conceded_per_match", None), 1.0)),
+    "DEF": ((("xg_for_per_match", "goals_for_per_match"), 1.0),
+            (("big_chances_conceded_per_match", None), 1.0)),
 }
 
 
 def fixture_difficulty(pos, opponent_stats):
+    """Opponent difficulty for one fixture, from that opponent's strength at the
+    venue they will be playing at.
+
+    The absolute scale differs by position group -- GKP/DEF read the opponent's
+    attack, MID/FWD read their defence -- so these numbers are only ever
+    comparable within a position. compute_rank z-scores them per position for
+    exactly that reason."""
     if not opponent_stats:
         return None
-    components = FIXTURE_DIFFICULTY_COMPONENTS[pos]
-    terms = [weight * opponent_stats[name] for name, weight in components if opponent_stats.get(name) is not None]
+    terms = []
+    for names, weight in FIXTURE_DIFFICULTY_COMPONENTS[pos]:
+        for name in (n for n in names if n):
+            value = opponent_stats.get(name)
+            if value is not None:
+                terms.append(weight * value)
+                break
     return round(sum(terms), 3) if terms else None
 
 
-def compute_fixture_score(club_fixtures, count, pos, team_strength):
-    subset = club_fixtures[:count]
-    total = 0.0
-    counted = 0
-    for f in subset:
-        # Facing the opponent at the venue where they'll actually be playing:
-        # if we're home, they're away, and vice versa.
-        opponent_venue = "away" if f["is_home"] else "home"
-        opponent_stats = team_strength.get(f["opponent"], {}).get(opponent_venue)
-        difficulty = fixture_difficulty(pos, opponent_stats)
-        if difficulty is not None:
-            total += difficulty
-            counted += 1
-    return round(total, 3) if counted else None
+def compute_pool_stats(pool, component_names, position_relative):
+    """Mean/population-stdev per component across the ranking pool.
 
-
-def attach_fixture_scores(records, fixtures_next6, team_strength):
-    for record in records:
-        club_fixtures = fixtures_next6.get(record["club"], [])
-        record["fixture_score"] = compute_fixture_score(club_fixtures, 6, record["pos"], team_strength)
-        record["fdr_next3"] = compute_fixture_score(club_fixtures, 3, record["pos"], team_strength)
-
-
-def compute_pool_stats(pool, component_names):
-    """Mean/population-stdev per rank component across the full ranking pool
-    (squad + watchlist), ignoring nulls. std 0 -> every z-score for that
-    component is defined as 0 (compute_rank handles the division)."""
+    Components in position_relative get their own stats per position group.
+    Those are quantities whose scale differs by position for reasons that have
+    nothing to do with player quality -- fixture_score reads the opponent's
+    attack for GKP/DEF and their defence for MID/FWD, producing disjoint ranges,
+    and DefCon thresholds differ by position. Pooling them made the z-score
+    encode position rather than merit. Components measuring genuinely comparable
+    things (attacking output, minutes, value) stay pooled, so a forward's real
+    scoring advantage over a defender still counts."""
     stats = {}
     for name in component_names:
-        values = [p[name] for p in pool if p.get(name) is not None]
-        mean_ = round(statistics.fmean(values), 4) if values else 0.0
-        std_ = round(statistics.pstdev(values), 4) if len(values) > 1 else 0.0
-        stats[name] = {"mean": mean_, "std": std_, "n": len(values)}
+        if name in position_relative:
+            for pos in {p["pos"] for p in pool}:
+                subset = [p[name] for p in pool if p["pos"] == pos and p.get(name) is not None]
+                stats[(name, pos)] = _mean_std(subset)
+        else:
+            stats[name] = _mean_std([p[name] for p in pool if p.get(name) is not None])
     return stats
+
+
+def _mean_std(values):
+    return {
+        "mean": round(statistics.fmean(values), 4) if values else 0.0,
+        "std": round(statistics.pstdev(values), 4) if len(values) > 1 else 0.0,
+        "n": len(values),
+    }
+
+
+def lookup_stats(pool_stats, name, pos, position_relative):
+    key = (name, pos) if name in position_relative else name
+    return pool_stats.get(key) or {"mean": 0.0, "std": 0.0, "n": 0}
 
 
 def zscore(value, stats):
@@ -400,45 +526,122 @@ def zscore(value, stats):
     return (value - stats["mean"]) / stats["std"]
 
 
-def compute_rank(player, pool_stats):
-    """z-scored, null-safe weighted composite. Each present component is
-    converted to a z-score against the squad+watchlist pool before weighting,
-    so components on wildly different scales (fixture_score's raw xG units vs.
-    points_per_million) contribute comparably. Missing components are excluded
-    from both the numerator and the weight total, rather than zeroed, so a
-    player scored on 3 of 4 components isn't penalized against one scored on
-    all 4 -- rank_score is always effectively a weighted *average* of the
-    z-scores actually available."""
-    z = {
-        "xgi_per90": zscore(player.get("xgi_per90"), pool_stats["xgi_per90"]),
-        "minutes_per_app": zscore(player.get("minutes_per_app"), pool_stats["minutes_per_app"]),
-        "points_per_million": zscore(player.get("points_per_million"), pool_stats["points_per_million"]),
+def availability(player):
+    """0.0 unavailable, 1.0 fully fit, fractional for doubtful.
+
+    FPL status codes: a available, d doubtful, i injured, s suspended,
+    u unavailable, n not in squad. chance_of_playing_next_round refines it."""
+    status = player.get("status")
+    chance = player.get("chance_of_playing")
+    if status in ("i", "s", "u", "n"):
+        return 0.0
+    if chance is not None:
+        return max(0.0, min(chance / 100.0, 1.0))
+    return 0.5 if status == "d" else 1.0
+
+
+def derive_rank_inputs(player):
+    """The raw quantities rank_score is built from, one per component.
+
+    Several are derived rather than raw so nothing is double-counted:
+    xg_per90 and xa_per90 sum exactly to xgi_per90 and so feed the model
+    through it; price feeds through points_per_million; apps feeds through
+    starts_rate and bonus_per90. selling_price is a verbatim copy of price and
+    carries no independent signal."""
+    apps = player.get("apps") or 0
+    minutes_total = player.get("minutes_total") or 0
+    nineties = minutes_total / 90 if minutes_total else 0
+    net = player.get("net_transfers")
+    return {
+        "xgi_per90": player.get("xgi_per90"),
+        "minutes_per_app": player.get("minutes_per_app"),
+        "starts_rate": round(player["starts"] / apps, 3) if apps and player.get("starts") is not None else None,
+        "fixture_score": player.get("fixture_score"),
+        "fdr_next3": player.get("fdr_next3"),
+        "points_per_million": player.get("points_per_million"),
+        "form": player.get("form"),
+        "defcon_per90": player.get("defcon_per90"),
+        "defcon_hit_rate": player.get("defcon_hit_rate"),
+        "bonus_per90": round(player["bonus_total"] / nineties, 3)
+        if nineties and player.get("bonus_total") is not None else None,
+        "net_transfers": net,
+        "rival_ownership": player.get("rival_ownership"),
+        "ownership": player.get("ownership"),
+        "availability": availability(player),
     }
-    fixture_z = zscore(player.get("fixture_score"), pool_stats["fixture_score"])
-    z["fixture_score"] = -fixture_z if fixture_z is not None else None  # lower fixture_score is better
-
-    rank_basis = [name for name in RANK_WEIGHTS if z[name] is not None]
-    rank_components = {name: (round(z[name], 4) if z[name] is not None else None) for name in RANK_WEIGHTS}
-    weights_used = {name: RANK_WEIGHTS[name] for name in rank_basis}
-
-    if not rank_basis:
-        return None, [], rank_components, {}
-
-    weight_total = sum(weights_used.values())
-    rank_score = round(sum(RANK_WEIGHTS[name] * z[name] for name in rank_basis) / weight_total, 4)
-    return rank_score, rank_basis, rank_components, weights_used
 
 
-def rank_and_sort_watchlist(watchlist, pool):
-    pool_stats = compute_pool_stats(pool, RANK_WEIGHTS.keys())
-    for player in watchlist:
-        rank_score, rank_basis, rank_components, weights_used = compute_rank(player, pool_stats)
-        player["rank_score"] = rank_score
-        player["rank_basis"] = rank_basis
-        player["rank_components"] = rank_components
-        player["weights_used"] = weights_used
-    watchlist.sort(key=lambda p: (p["rank_score"] is None, -(p["rank_score"] or 0)))
-    return pool_stats
+def compute_rank(values, pos, pool_stats):
+    """Weighted mean of component z-scores, shrunk by how much of the model a
+    player actually has data for.
+
+    Takes pre-derived values rather than the raw player so that the same derived
+    quantities feed both the pool statistics and the scoring -- derived fields
+    like starts_rate and availability do not exist on the player record, and
+    reading them from there silently produced a zero-variance pool.
+
+    Missing components are treated as pool-average (z 0) and the divisor is the
+    FULL weight total, not just the weights present. The previous version
+    divided by the weights used, which turned "we know almost nothing about this
+    player" into "average of the two things we do know" -- a player with only
+    fixtures and price ranked seventh on no evidence. Dividing by the full total
+    shrinks the unknown toward the middle instead, and RANK_MIN_COVERAGE refuses
+    to rank anyone below a floor of evidence at all.
+
+    Players who cannot play are excluded outright rather than scored, since no
+    amount of underlying quality helps a suspended player this gameweek."""
+    if values["availability"] == 0.0:
+        return {"rank_score": None, "rank_basis": [], "rank_components": {},
+                "weights_used": {}, "rank_coverage": 0.0,
+                "rank_excluded_reason": "unavailable"}
+
+    z, components = {}, {}
+    for name in RANK_WEIGHTS:
+        stats = lookup_stats(pool_stats, name, pos, POSITION_RELATIVE_COMPONENTS)
+        raw = zscore(values[name], stats)
+        if raw is not None and name in LOWER_IS_BETTER:
+            raw = -raw
+        z[name] = raw
+        components[name] = None if raw is None else round(raw, 4)
+
+    rank_basis = [n for n in RANK_WEIGHTS if z[n] is not None]
+    weights_used = {n: RANK_WEIGHTS[n] for n in rank_basis}
+    total_weight = sum(RANK_WEIGHTS.values())
+    coverage = round(sum(weights_used.values()) / total_weight, 3)
+
+    if coverage < RANK_MIN_COVERAGE:
+        return {"rank_score": None, "rank_basis": rank_basis, "rank_components": components,
+                "weights_used": weights_used, "rank_coverage": coverage,
+                "rank_excluded_reason": f"insufficient data (coverage {coverage} < {RANK_MIN_COVERAGE})"}
+
+    score = sum(RANK_WEIGHTS[n] * z[n] for n in rank_basis) / total_weight
+    return {"rank_score": round(score, 4), "rank_basis": rank_basis, "rank_components": components,
+            "weights_used": weights_used, "rank_coverage": coverage, "rank_excluded_reason": None}
+
+
+def rank_players(pool):
+    """Score every player in the pool -- squad and watchlist alike -- against the
+    same distribution, so a player you own can be compared directly with a
+    transfer target.
+
+    Derived inputs are computed once up front and reused for both the pool
+    statistics and each player's score, so the two can never disagree."""
+    inputs = []
+    for player in pool:
+        values = derive_rank_inputs(player)
+        values["pos"] = player["pos"]
+        inputs.append(values)
+        # Surface the derived quantities so the score stays auditable.
+        player.update({k: values[k] for k in ("starts_rate", "bonus_per90", "availability")})
+
+    pool_stats = compute_pool_stats(inputs, RANK_WEIGHTS.keys(), POSITION_RELATIVE_COMPONENTS)
+    for player, values in zip(pool, inputs):
+        player.update(compute_rank(values, player["pos"], pool_stats))
+    return {(f"{k[0]}|{k[1]}" if isinstance(k, tuple) else k): v for k, v in pool_stats.items()}
+
+
+def sort_by_rank(players):
+    players.sort(key=lambda p: (p["rank_score"] is None, -(p["rank_score"] or 0)))
 
 
 def parse_kickoff_date(value):
@@ -598,6 +801,71 @@ def build_rivals(league_ids, picks_gw, elements):
     return rivals
 
 
+def count_rival_ownership(rivals, elements):
+    """How many league rivals own each player, by player_id.
+
+    rivals[] was previously display-only. Counting it turns the standings into a
+    scoring signal: a player half your league already owns protects your rank
+    less than an equally good player none of them have."""
+    name_to_ids = defaultdict(list)
+    for pid, el in elements.items():
+        name_to_ids[el["web_name"]].append(pid)
+    counts = defaultdict(int)
+    seen_entries = set()
+    for league_rivals in rivals.values():
+        for rival in league_rivals:
+            if rival["entry_id"] in seen_entries:
+                continue  # a rival in both leagues must not be counted twice
+            seen_entries.add(rival["entry_id"])
+            for pick_name in set(rival.get("picks") or []):
+                # Ambiguous web_names are rare; credit every match rather than guess.
+                for pid in name_to_ids.get(pick_name, []):
+                    counts[pid] += 1
+    return counts, len(seen_entries)
+
+
+def attach_rival_ownership(records, counts, rival_total):
+    for record in records:
+        record["rival_ownership"] = (
+            round(counts.get(record["player_id"], 0) / rival_total, 3) if rival_total else None
+        )
+
+
+def build_transfer_options(my_squad, watchlist, bank, free_transfers):
+    """Which upgrades you can actually afford right now.
+
+    bank, squad_value and free_transfers are entry-level constants -- the same
+    number for every player -- so they cannot differentiate anyone inside a
+    per-player z-score. They belong here instead, gating the ranking by what is
+    actually executable: an upgrade you cannot fund is not a recommendation."""
+    ranked_squad = [p for p in my_squad if p.get("rank_score") is not None]
+    options = []
+    for target in (p for p in watchlist if p.get("rank_score") is not None):
+        for held in ranked_squad:
+            if held["pos"] != target["pos"]:
+                continue  # FPL transfers are position-for-position
+            budget = round(held["selling_price"] + bank, 1)
+            if target["price"] > budget:
+                continue
+            gain = round(target["rank_score"] - held["rank_score"], 4)
+            if gain <= 0:
+                continue
+            options.append({
+                "out": held["name"], "out_pos": held["pos"], "out_rank_score": held["rank_score"],
+                "in": target["name"], "in_pos": target["pos"], "in_rank_score": target["rank_score"],
+                "rank_gain": gain,
+                "cost_change": round(target["price"] - held["selling_price"], 1),
+                "bank_after": round(budget - target["price"], 1),
+            })
+    options.sort(key=lambda o: -o["rank_gain"])
+    return {
+        "free_transfers": free_transfers,
+        "bank": bank,
+        "affordable_upgrades": options[:25],
+        "affordable_upgrade_count": len(options),
+    }
+
+
 def attach_player_stats(records, elements, cache, latest_finished_gw):
     for record in records:
         el = elements[record["player_id"]]
@@ -638,7 +906,7 @@ def main():
         "minutes_total": None, "minutes_per_app": None, "starts": None, "apps": None,
         "xg_per90": None, "xa_per90": None, "xgi_per90": None, "defcon_per90": None,
         "defcon_hit_rate": None, "points_per_million": None, "bonus_total": None,
-        "fixture_score": None, "fdr_next3": None,
+        "fixture_score": None, "fdr_next3": None, "rival_ownership": None,
     }
     my_squad = [
         player_record(elements[pid], teams_by_id, types_by_id, empty_stats)
@@ -659,11 +927,21 @@ def main():
     watched_club_ids = {elements[p["player_id"]]["team"] for p in my_squad + watchlist}
     fixtures_next6 = build_fixtures_next6(fixtures, teams_by_id, watched_club_ids)
 
-    team_strength = build_team_strength(fixtures, teams_by_id)
+    team_strength = build_team_strength(fixtures, teams_by_id, elements)
 
     attach_fixture_scores(my_squad, fixtures_next6, team_strength)
     attach_fixture_scores(watchlist, fixtures_next6, team_strength)
-    pool_stats = rank_and_sort_watchlist(watchlist, my_squad + watchlist)
+
+    # Rivals feed rank_ownership, so they must be fetched before ranking.
+    rivals = build_rivals(league_ids, picks_gw, elements)
+    rival_counts, rival_total = count_rival_ownership(rivals, elements)
+    attach_rival_ownership(my_squad, rival_counts, rival_total)
+    attach_rival_ownership(watchlist, rival_counts, rival_total)
+
+    # Squad and watchlist are scored against the same distribution, so a player
+    # you own is directly comparable with a transfer target.
+    pool_stats = rank_players(my_squad + watchlist)
+    sort_by_rank(watchlist)
 
     # Informational only, and applied after every score above is already final.
     european_clubs = config.get("european_clubs", {})
@@ -671,25 +949,16 @@ def main():
     annotate_european_context(fixtures_next6, european_by_club)
     warn_european_calendar_stale(european_clubs, european_by_club, fixtures_next6)
 
-    rivals = build_rivals(league_ids, picks_gw, elements)
-
-    price_watch = []
-    for pid in my_ids:
-        el = elements[pid]
-        transfers_in = el.get("transfers_in_event", 0)
-        transfers_out = el.get("transfers_out_event", 0)
-        price_watch.append(
-            {
-                "name": el["web_name"],
-                "transfers_in": transfers_in,
-                "transfers_out": transfers_out,
-                "net": transfers_in - transfers_out,
-            }
-        )
+    price_watch = [
+        {"name": p["name"], "transfers_in": p["transfers_in_event"],
+         "transfers_out": p["transfers_out_event"], "net": p["net_transfers"]}
+        for p in my_squad
+    ]
 
     bank = entry_info.get("last_deadline_bank", 0) / 10
     squad_value = entry_info.get("last_deadline_value", 0) / 10
     free_transfers = compute_free_transfers(entry_history, picks_gw)
+    transfer_options = build_transfer_options(my_squad, watchlist, bank, free_transfers)
 
     all_watched_players = my_squad + watchlist
     data_maturity = {
@@ -706,6 +975,8 @@ def main():
         "my_squad": my_squad,
         "watchlist": watchlist,
         "watchlist_rank_stats": pool_stats,
+        "rank_weights": RANK_WEIGHTS,
+        "transfer_options": transfer_options,
         "fixtures_next6": fixtures_next6,
         "european_clubs": european_clubs,
         "team_strength": team_strength,
