@@ -19,6 +19,7 @@ CONFIG_PATH = os.path.join(ROOT, "config.json")
 OUTPUT_PATH = os.path.join(ROOT, "snapshot.json")
 ELEMENT_SUMMARY_CACHE_PATH = os.path.join(ROOT, "data", "element_summary_cache.json")
 DEADLINE_STATE_DIR = os.path.join(ROOT, "data", "deadline_state")
+PREDICTIONS_PATH = os.path.join(ROOT, "predictions.json")
 CALIBRATION_PATH = os.path.join(ROOT, "calibration.csv")
 
 CHIPS_THAT_SKIP_TRANSFER_DEDUCTION = {"wildcard", "freehit"}
@@ -97,6 +98,14 @@ PRESELECT_POSITION_RELATIVE = {"fixture_ease_next3", "fixture_ease_next1"}
 # Never consider a player who cannot play, or who has not played at all -- 17 of
 # 60 slots were going to such players under the old ownership sort.
 PRESELECT_REQUIRE_MINUTES = True
+
+# A player is ineligible when FPL says they cannot play, or when their reported
+# chance of playing falls below this. Distinct from `availability`, which is a
+# continuous 0-1 multiplier feeding the score: `eligible` is a hard yes/no flag
+# for filtering, and it does NOT suppress rank_score -- an ineligible player is
+# still scored so you can see what you are missing and why.
+ELIGIBILITY_MIN_CHANCE = 75
+UNAVAILABLE_STATUSES = ("i", "s", "u", "n")
 
 # A European tie this many calendar days or fewer before a league kickoff is flagged.
 EUROPEAN_RECOVERY_THRESHOLD_DAYS = 4
@@ -260,7 +269,11 @@ def compute_free_transfers(history, upcoming_event_id):
 
 
 def build_fixtures_next6(fixtures, teams_by_id, club_ids):
-    upcoming = [f for f in fixtures if not f["finished"] and f.get("event")]
+    # Third place that had its own idea of "played". event/fixture `finished`
+    # lags the final whistle, so a scored fixture stayed in the next-6 window
+    # for hours -- inflating fixture_score with a game already in the books.
+    # Same rule as everywhere else now: a fixture with a score is not upcoming.
+    upcoming = [f for f in fixtures if f.get("event") and f.get("team_h_score") is None]
     upcoming.sort(key=lambda f: (f["event"], f.get("kickoff_time") or ""))
 
     fixtures_next6 = {}
@@ -688,11 +701,31 @@ def availability(player):
     u unavailable, n not in squad. chance_of_playing_next_round refines it."""
     status = player.get("status")
     chance = player.get("chance_of_playing")
-    if status in ("i", "s", "u", "n"):
+    if status in UNAVAILABLE_STATUSES:
         return 0.0
     if chance is not None:
         return max(0.0, min(chance / 100.0, 1.0))
     return 0.5 if status == "d" else 1.0
+
+
+def eligible(player):
+    """Hard yes/no: can this player realistically be picked this gameweek?
+
+    Deliberately stricter and blunter than `availability`. availability is a
+    continuous multiplier that shades a score; eligible is a filter. A player on
+    a 75% chance is scored at 0.75 availability but is still eligible, while
+    anything below that -- or an injury, suspension, unavailability or
+    out-of-squad flag -- is not.
+
+    It does NOT suppress rank_score. Scoring an ineligible player is what lets
+    you see that your injured striker was still the best forward you own, rather
+    than a null that tells you nothing."""
+    if player.get("status") in UNAVAILABLE_STATUSES:
+        return False
+    chance = player.get("chance_of_playing")
+    if chance is not None and chance < ELIGIBILITY_MIN_CHANCE:
+        return False
+    return True
 
 
 def derive_rank_inputs(player):
@@ -724,6 +757,7 @@ def derive_rank_inputs(player):
         "rival_ownership": player.get("rival_ownership"),
         "ownership": player.get("ownership"),
         "availability": availability(player),
+        "eligible": eligible(player),
     }
 
 
@@ -744,14 +778,10 @@ def compute_rank(values, pos, pool_stats):
     shrinks the unknown toward the middle instead, and RANK_MIN_COVERAGE refuses
     to rank anyone below a floor of evidence at all.
 
-    Players who cannot play are excluded outright rather than scored, since no
-    amount of underlying quality helps a suspended player this gameweek."""
-    if values["availability"] == 0.0:
-        return {"rank_score": None, "rank_score_before_availability": None,
-                "availability_penalty": None, "rank_basis": [], "rank_components": {},
-                "weights_used": {}, "rank_coverage": 0.0,
-                "rank_excluded_reason": "unavailable"}
-
+    Players who cannot play are still scored, and carry the full availability
+    penalty plus `eligible: false`. Nulling them out lost real information --
+    that an injured player was nonetheless the strongest option at his position
+    is exactly what you need in order to decide whether to wait for him."""
     z, components = {}, {}
     for name in RANK_WEIGHTS:
         stats = lookup_stats(pool_stats, name, pos, POSITION_RELATIVE_COMPONENTS)
@@ -766,17 +796,24 @@ def compute_rank(values, pos, pool_stats):
     total_weight = sum(RANK_WEIGHTS.values())
     coverage = round(sum(weights_used.values()) / total_weight, 3)
 
+    # A score built without BOTH attacking output and minutes is not a player
+    # rating -- it is the club's fixture run wearing a player's name. Flagged
+    # rather than dropped, since it may still be the only read available.
+    fixture_proxy = not ({"xgi_per90", "minutes_per_app"} & set(rank_basis))
+
     if coverage < RANK_MIN_COVERAGE:
         return {"rank_score": None, "rank_score_before_availability": None,
                 "availability_penalty": None, "rank_basis": rank_basis, "rank_components": components,
                 "weights_used": weights_used, "rank_coverage": coverage,
+                "rank_fixture_proxy": fixture_proxy,
                 "rank_excluded_reason": f"insufficient data (coverage {coverage} < {RANK_MIN_COVERAGE})"}
 
     score = sum(RANK_WEIGHTS[n] * z[n] for n in rank_basis) / total_weight
     penalty = round(AVAILABILITY_PENALTY * (1.0 - values["availability"]), 4)
     return {"rank_score": round(score - penalty, 4), "rank_score_before_availability": round(score, 4),
             "availability_penalty": penalty, "rank_basis": rank_basis, "rank_components": components,
-            "weights_used": weights_used, "rank_coverage": coverage, "rank_excluded_reason": None}
+            "weights_used": weights_used, "rank_coverage": coverage,
+            "rank_fixture_proxy": fixture_proxy, "rank_excluded_reason": None}
 
 
 def rank_players(pool):
@@ -792,7 +829,8 @@ def rank_players(pool):
         values["pos"] = player["pos"]
         inputs.append(values)
         # Surface the derived quantities so the score stays auditable.
-        player.update({k: values[k] for k in ("starts_rate", "bonus_per90", "availability")})
+        player.update({k: values[k] for k in
+                       ("starts_rate", "bonus_per90", "availability", "eligible")})
 
     pool_stats = compute_pool_stats(inputs, RANK_WEIGHTS.keys(), POSITION_RELATIVE_COMPONENTS)
     for player, values in zip(pool, inputs):
@@ -936,7 +974,15 @@ def warn_european_calendar_stale(european_clubs, european_by_club, fixtures_next
 
 
 def build_rivals(league_ids, picks_gw, elements):
-    """Top 20 per league, with each rival's picks.
+    """Top 20 per league, with each rival's full picks.
+
+    Each pick keeps the four fields the picks endpoint actually returns beyond
+    the element id: is_captain, is_vice_captain, multiplier and position.
+    Together they say far more than a bare name list did. position 1-11 is the
+    starting XI and 12-15 the bench, so it distinguishes a rival who owns a
+    player from one who is actually starting him; multiplier is 0 for a benched
+    player, 2 for the captain and 3 under a triple-captain chip, so it also
+    exposes chip usage that no other endpoint reports.
 
     Also returns picks per league as element IDs. IDs rather than web_names:
     names are not unique in this league (there are two Palmers), and the old
@@ -950,15 +996,33 @@ def build_rivals(league_ids, picks_gw, elements):
             rival_entry_id = r["entry"]
             try:
                 resp = get(f"entry/{rival_entry_id}/event/{picks_gw}/picks/")
-                pick_ids = [p["element"] for p in resp["picks"]]
+                raw_picks = resp["picks"]
             except requests.RequestException:
-                pick_ids = []
-            league_picks.append({"entry_id": rival_entry_id, "ids": set(pick_ids)})
+                raw_picks = []
+            picks = [
+                {
+                    "player_id": p["element"],
+                    "name": elements[p["element"]]["web_name"],
+                    "is_captain": bool(p.get("is_captain")),
+                    "is_vice_captain": bool(p.get("is_vice_captain")),
+                    "multiplier": p.get("multiplier"),
+                    "position": p.get("position"),
+                }
+                for p in raw_picks if p["element"] in elements
+            ]
+            captain = next((p["player_id"] for p in picks if p["is_captain"]), None)
+            league_picks.append({
+                "entry_id": rival_entry_id,
+                "ids": {p["player_id"] for p in picks},
+                "captain": captain,
+            })
             league_rivals.append({
                 "entry_id": rival_entry_id,
                 "name": r["player_name"],
                 "total": r["total"],
-                "picks": [elements[pid]["web_name"] for pid in pick_ids if pid in elements],
+                "captain": next((p["name"] for p in picks if p["is_captain"]), None),
+                "vice_captain": next((p["name"] for p in picks if p["is_vice_captain"]), None),
+                "picks": picks,
             })
             time.sleep(0.1)
         rivals[str(league_id)] = league_rivals
@@ -976,11 +1040,13 @@ def compute_league_ownership(picks_by_league):
     of each is fetched."""
     per_league, overall = {}, defaultdict(int)
     for league_id, squads in picks_by_league.items():
-        counts = defaultdict(int)
+        counts, captains = defaultdict(int), defaultdict(int)
         for squad in squads:
             for pid in squad["ids"]:
                 counts[pid] += 1
-        per_league[league_id] = {"counts": counts, "of": len(squads)}
+            if squad.get("captain") is not None:
+                captains[squad["captain"]] += 1
+        per_league[league_id] = {"counts": counts, "captains": captains, "of": len(squads)}
 
     # A rival appearing in both leagues is one manager, counted once overall.
     seen = set()
@@ -1002,28 +1068,75 @@ def attach_league_ownership(records, per_league, overall, overall_total):
                 "owned_by": data["counts"].get(pid, 0),
                 "of": data["of"],
                 "share": round(data["counts"].get(pid, 0) / data["of"], 3) if data["of"] else None,
+                # Captaincy is the sharper differential read: ownership costs you
+                # a player's points, captaincy costs you double them.
+                "captained_by": data["captains"].get(pid, 0),
+                "captain_share": round(data["captains"].get(pid, 0) / data["of"], 3) if data["of"] else None,
             }
             for league_id, data in per_league.items()
         }
         record["rival_ownership"] = round(overall.get(pid, 0) / overall_total, 3) if overall_total else None
 
 
+def build_captain_ownership(per_league, elements):
+    """Who each league is captaining, most-captained first.
+
+    The per-player view inside league_ownership answers "is my captain
+    differential?"; this answers the other half -- "what am I up against if I
+    do not captain the template pick?"."""
+    summary = {}
+    for league_id, data in per_league.items():
+        rows = [
+            {
+                "player_id": pid,
+                "name": elements[pid]["web_name"] if pid in elements else str(pid),
+                "captained_by": count,
+                "of": data["of"],
+                "share": round(count / data["of"], 3) if data["of"] else None,
+            }
+            for pid, count in data["captains"].items()
+        ]
+        rows.sort(key=lambda r: (-r["captained_by"], r["name"]))
+        summary[league_id] = rows
+    return summary
+
+
 def deadline_state_path(gameweek):
     return os.path.join(DEADLINE_STATE_DIR, f"gw{gameweek}.json")
 
 
-def capture_deadline_state(gameweek, deadline, pool, now):
-    """Freeze what the model believed BEFORE the deadline.
+def club_fixture_for_gw(fixtures_next6, club, gameweek):
+    """The club's fixture in one gameweek, as it was known before the deadline.
 
-    Calibration has to grade the score the model actually stood behind at the
-    time, not one recomputed later against finished results -- that would be
-    marking its own homework with the answers in hand. Every run before the
-    deadline overwrites this file, so it converges on the last pre-deadline
-    view; once the deadline passes, gw_next advances and this gameweek's file
-    is never touched again.
+    Stored with the prediction because a score is only interpretable next to the
+    game it was predicting: the same rank_score means different things away at
+    the leaders and at home to the bottom club. A club with a blank gameweek has
+    no entry and gets null; a double gameweek keeps the first fixture, which is
+    the one the next1 horizon scored."""
+    for fixture in fixtures_next6.get(club, []):
+        if fixture.get("gw") == gameweek:
+            return {
+                "opponent": fixture["opponent"],
+                "is_home": fixture["is_home"],
+                "kickoff_time": fixture.get("kickoff_time"),
+                "fpl_difficulty": fixture.get("difficulty"),
+            }
+    return None
 
-    Nothing is written at or after the deadline, so a post-deadline run cannot
-    contaminate the frozen state."""
+
+def capture_deadline_state(gameweek, deadline, pool, fixtures_next6, now):
+    """Freeze what the model believes BEFORE the deadline, into a working buffer.
+
+    This file is deliberately mutable: every run before the deadline overwrites
+    it, so it converges on the last pre-deadline view -- the freshest belief the
+    model actually held, after the week's team news rather than six days before
+    it. Nothing is written at or after the deadline, so a post-deadline run
+    cannot contaminate it.
+
+    It is not the permanent record. Once the deadline passes, seal_predictions
+    copies this buffer into predictions.json, which is append-only. Splitting
+    the two is what lets the prediction be both as late as possible and, once
+    recorded, immutable."""
     if not gameweek or not deadline:
         return None
     deadline_dt = parse_iso(deadline)
@@ -1044,6 +1157,9 @@ def capture_deadline_state(gameweek, deadline, pool, now):
                 "rank_basis": p.get("rank_basis") or [],
                 "rank_components": p.get("rank_components") or {},
                 "availability_penalty": p.get("availability_penalty"),
+                "eligible": p.get("eligible"),
+                "rank_fixture_proxy": p.get("rank_fixture_proxy"),
+                "fixture": club_fixture_for_gw(fixtures_next6, p["club"], gameweek),
             }
             for p in pool
         ],
@@ -1051,6 +1167,58 @@ def capture_deadline_state(gameweek, deadline, pool, now):
     with open(deadline_state_path(gameweek), "w") as f:
         json.dump(state, f, separators=(",", ":"))
     return state
+
+
+def load_predictions():
+    """The append-only prediction record, keyed by gameweek as a string."""
+    if not os.path.exists(PREDICTIONS_PATH):
+        return {"gameweeks": {}}
+    with open(PREDICTIONS_PATH) as f:
+        data = json.load(f)
+    data.setdefault("gameweeks", {})
+    return data
+
+
+def seal_predictions(events, now):
+    """Move every past-deadline buffer into predictions.json, once each.
+
+    A gameweek already recorded is left exactly as it was -- not refreshed, not
+    reconciled, not corrected. That immutability is the whole point: calibration
+    grades the prediction the model committed to, and a record that can be
+    rewritten after results are known is not a prediction.
+
+    The source is always the pre-deadline buffer, so sealing after the deadline
+    reads nothing that was not already frozen before it. A gameweek whose
+    buffer never existed is skipped rather than reconstructed."""
+    predictions = load_predictions()
+    sealed = {}
+    for event in events:
+        gameweek = event["id"]
+        key = str(gameweek)
+        if key in predictions["gameweeks"]:
+            continue
+        deadline = parse_iso(event.get("deadline_time"))
+        if deadline is None or now < deadline:
+            continue  # still open: the buffer is allowed to keep moving
+        path = deadline_state_path(gameweek)
+        if not os.path.exists(path):
+            continue  # no pre-deadline capture exists; never reconstruct one
+        with open(path) as f:
+            state = json.load(f)
+        predictions["gameweeks"][key] = {
+            "gameweek": gameweek,
+            "deadline": state["deadline"],
+            "captured_at": state["captured_at"],
+            "sealed_at": now.isoformat(),
+            "rank_weights": state.get("rank_weights", RANK_WEIGHTS),
+            "players": state["players"],
+        }
+        sealed[gameweek] = len(state["players"])
+
+    if sealed:
+        with open(PREDICTIONS_PATH, "w") as f:
+            json.dump(predictions, f, separators=(",", ":"))
+    return sealed
 
 
 def parse_iso(value):
@@ -1064,6 +1232,7 @@ def parse_iso(value):
 
 CALIBRATION_COLUMNS = (
     ["gameweek", "captured_at", "source", "player_id", "name", "club", "pos", "price",
+     "opponent", "was_home", "eligible", "rank_fixture_proxy",
      "rank_score", "rank_coverage", "availability_penalty"]
     + [f"z_{name}" for name in RANK_WEIGHTS]
     + ["rank_basis", "minutes_played", "actual_points"]
@@ -1078,6 +1247,47 @@ def logged_gameweeks():
         return {row["gameweek"] for row in csv.DictReader(f) if row.get("gameweek")}
 
 
+def gameweek_progress(fixtures):
+    """Reconcile the several senses of "this gameweek is done".
+
+    The script previously mixed two of them and reported a contradiction:
+    data_maturity said 0 gameweeks played while 51 players had 90+ minutes,
+    because it counted event["finished"], which FPL leaves False for a good
+    while after the last whistle (finished_provisional flips first). Meanwhile
+    build_team_match_log already keyed off team_h_score, and so saw the same
+    matches as played.
+
+    A fixture is played when it HAS A SCORE, which is the only signal that
+    flips promptly and never lies. From that, three distinct senses:
+
+      played    -- at least one fixture has a score. What data_maturity means:
+                   is there any of this gameweek in the underlying stats yet.
+      complete  -- every fixture has a score. What the element-summary cache
+                   keys off, so a gameweek is only cached once whole.
+      locked    -- FPL has set data_checked, meaning bonus is applied and the
+                   points are final. What calibration waits for; strictly later
+                   than complete, and the only one that is not derived here.
+    """
+    scored, total = defaultdict(int), defaultdict(int)
+    for fixture in fixtures:
+        gameweek = fixture.get("event")
+        if not gameweek:
+            continue  # unscheduled fixture, not yet assigned to a gameweek
+        total[gameweek] += 1
+        if fixture.get("team_h_score") is not None:
+            scored[gameweek] += 1
+
+    played = sorted(gw for gw in total if scored[gw] > 0)
+    complete = sorted(gw for gw in total if scored[gw] == total[gw])
+    return {
+        "played": played,
+        "complete": complete,
+        "latest_complete": max(complete, default=0),
+        "fixtures_scored": {gw: scored[gw] for gw in played},
+        "fixtures_total": {gw: total[gw] for gw in played},
+    }
+
+
 def scores_locked(event):
     """FPL flips finished first and data_checked once bonus is applied and the
     numbers are final, so data_checked is the one to wait for."""
@@ -1085,25 +1295,30 @@ def scores_locked(event):
 
 
 def append_calibration_rows(events, elements, cache, latest_finished_gw):
-    """Append one row per player per locked gameweek, joining the frozen
-    pre-deadline score to what actually happened.
+    """Append one row per player per locked gameweek, joining the recorded
+    prediction to what actually happened.
+
+    Every predicted quantity here is READ from predictions.json, never
+    recomputed. Recomputing at lock time would score the player against
+    finished results and grade the model on hindsight; if a gameweek has no
+    recorded prediction, it is skipped, not reconstructed.
 
     Append-only: a gameweek already present is skipped rather than rewritten,
     so history cannot be quietly revised."""
     already = logged_gameweeks()
+    predictions = load_predictions()["gameweeks"]
     appended = {}
     for event in events:
         gameweek = event["id"]
         if not scores_locked(event) or str(gameweek) in already:
             continue
-        path = deadline_state_path(gameweek)
-        if not os.path.exists(path):
-            continue  # no pre-deadline capture exists; never reconstruct one
-        with open(path) as f:
-            state = json.load(f)
+        state = predictions.get(str(gameweek))
+        if state is None:
+            continue  # no recorded prediction; never reconstruct one
 
         rows = []
         for player in state["players"]:
+            fixture = player.get("fixture") or {}
             # Players who have since left the watchlist are still graded, so the
             # log is not silently restricted to those the model still likes.
             history = fetch_player_history(player["player_id"], cache, latest_finished_gw)
@@ -1117,6 +1332,10 @@ def append_calibration_rows(events, elements, cache, latest_finished_gw):
                 "club": player["club"],
                 "pos": player["pos"],
                 "price": player["price"],
+                "opponent": fixture.get("opponent"),
+                "was_home": fixture.get("is_home"),
+                "eligible": player.get("eligible"),
+                "rank_fixture_proxy": player.get("rank_fixture_proxy"),
                 "rank_score": player["rank_score"],
                 "rank_coverage": player["rank_coverage"],
                 "availability_penalty": player["availability_penalty"],
@@ -1198,10 +1417,11 @@ def main():
     gw_next = next_event["id"] if next_event else None
     next_deadline = next_event["deadline_time"] if next_event else None
     picks_gw = gw_current or gw_next
-    finished_events = [e for e in events if e["finished"]]
-    latest_finished_gw = max((e["id"] for e in finished_events), default=0)
 
     fixtures = get("fixtures/")
+    # All three senses of "done" come from one place -- see gameweek_progress.
+    progress = gameweek_progress(fixtures)
+    latest_finished_gw = progress["latest_complete"]
     entry_info = get(f"entry/{entry_id}/")
     entry_history = get(f"entry/{entry_id}/history/")
     my_picks_resp = get(f"entry/{entry_id}/event/{picks_gw}/picks/")
@@ -1241,6 +1461,7 @@ def main():
     # Rivals feed rank_ownership, so they must be fetched before ranking.
     rivals, picks_by_league = build_rivals(league_ids, picks_gw, elements)
     per_league, overall_counts, overall_total = compute_league_ownership(picks_by_league)
+    captain_ownership = build_captain_ownership(per_league, elements)
     attach_league_ownership(my_squad, per_league, overall_counts, overall_total)
     attach_league_ownership(watchlist, per_league, overall_counts, overall_total)
 
@@ -1272,9 +1493,26 @@ def main():
 
     all_watched_players = my_squad + watchlist
     data_maturity = {
-        "gameweeks_played": len(finished_events),
+        # Gameweeks with at least one played (scored) fixture. Previously read
+        # event["finished"], which lags the pitch by hours and reported 0 while
+        # 51 tracked players already had 90+ minutes on the board.
+        "gameweeks_played": len(progress["played"]),
+        # Gameweeks where every fixture is played. The stricter figure, and the
+        # one the element-summary cache invalidates on.
+        "gameweeks_complete": len(progress["complete"]),
+        "gameweeks_locked": sum(1 for e in events if scores_locked(e)),
+        "gameweeks_played_basis": "fixtures with a score, not event.finished",
+        "fixtures_played_by_gameweek": {
+            str(gw): {"scored": progress["fixtures_scored"][gw],
+                      "of": progress["fixtures_total"][gw]}
+            for gw in progress["played"]
+        },
         "players_with_90plus_minutes": sum(
             1 for p in all_watched_players if p["minutes_total"] is not None and p["minutes_total"] >= 90
+        ),
+        "players_ineligible": sum(1 for p in all_watched_players if p.get("eligible") is False),
+        "players_scored_on_fixtures_alone": sum(
+            1 for p in all_watched_players if p.get("rank_fixture_proxy")
         ),
     }
 
@@ -1292,6 +1530,7 @@ def main():
         "european_clubs": european_clubs,
         "team_strength": team_strength,
         "rivals": rivals,
+        "captain_ownership": captain_ownership,
         "price_watch": price_watch,
         "bank": bank,
         "squad_value": squad_value,
@@ -1299,11 +1538,15 @@ def main():
         "data_maturity": data_maturity,
     }
 
-    # Freeze the pre-deadline view, then grade any gameweek whose scores have
-    # locked. Capture happens after scoring so the frozen state is the real one,
-    # and only ever before the deadline itself.
+    # Three stages, each strictly later than the last: freeze the pre-deadline
+    # view into a mutable buffer, seal past-deadline buffers into the append-only
+    # prediction record, then grade any gameweek whose scores have locked against
+    # what was recorded. Capture happens after scoring so the frozen state is the
+    # real one, and only ever before the deadline itself.
     now = datetime.now(timezone.utc)
-    captured = capture_deadline_state(gw_next, next_deadline, my_squad + watchlist, now)
+    captured = capture_deadline_state(
+        gw_next, next_deadline, my_squad + watchlist, fixtures_next6, now)
+    sealed = seal_predictions(events, now)
     appended = append_calibration_rows(events, elements, cache, latest_finished_gw)
     save_element_summary_cache(cache)
 
@@ -1317,10 +1560,32 @@ def main():
               f"({len(captured['players'])} players, deadline {captured['deadline']})")
     else:
         print(f"no deadline state captured (GW{gw_next} deadline {next_deadline} has passed or is unknown)")
+    for gameweek, count in sorted(sealed.items()):
+        print(f"predictions.json: sealed GW{gameweek} ({count} players)")
     for gameweek, count in sorted(appended.items()):
         print(f"calibration.csv: appended {count} rows for GW{gameweek}")
     if not appended:
         print("calibration.csv: nothing new to append")
+
+    # A rank_score built without BOTH attacking output and minutes is really a
+    # read on the club's fixture run, so say so rather than let it pass as a
+    # player rating.
+    proxies = [p for p in all_watched_players if p.get("rank_fixture_proxy")]
+    if proxies:
+        print(f"\nWARNING: {len(proxies)} player(s) scored without xgi_per90 OR minutes_per_app "
+              f"-- these are fixture proxies, not player ratings:")
+        for p in sorted(proxies, key=lambda x: -(x["rank_score"] or 0)):
+            print(f"  {p['name']:<20} {p['club']:<4} {p['pos']:<4} "
+                  f"rank_score={p['rank_score']} coverage={p['rank_coverage']} "
+                  f"source={p['source']} basis={','.join(p['rank_basis'])}")
+
+    ineligible = [p for p in all_watched_players if p.get("eligible") is False]
+    if ineligible:
+        print(f"\n{len(ineligible)} player(s) flagged ineligible (still scored):")
+        for p in sorted(ineligible, key=lambda x: -(x["rank_score"] or 0)):
+            print(f"  {p['name']:<20} {p['club']:<4} {p['pos']:<4} "
+                  f"status={p['status']} chance={p['chance_of_playing']} "
+                  f"rank_score={p['rank_score']} source={p['source']}")
     if size_bytes > 500 * 1024:
         print("WARNING: snapshot exceeds 500KB target", file=sys.stderr)
         sys.exit(1)

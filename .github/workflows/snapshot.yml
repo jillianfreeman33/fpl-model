@@ -36,7 +36,7 @@ jobs:
           # calibration.csv does not exist until the first gameweek locks, and
           # git add errors on a missing pathspec under `bash -e`.
           for path in snapshot.json data/element_summary_cache.json \
-                      data/deadline_state calibration.csv; do
+                      data/deadline_state predictions.json calibration.csv; do
             if [ -e "$path" ]; then git add "$path"; fi
           done
           if git diff --cached --quiet; then
