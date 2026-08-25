@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Fetch a daily FPL data snapshot and write it to snapshot.json."""
+import csv
 import json
 import os
 import statistics
@@ -17,6 +18,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 OUTPUT_PATH = os.path.join(ROOT, "snapshot.json")
 ELEMENT_SUMMARY_CACHE_PATH = os.path.join(ROOT, "data", "element_summary_cache.json")
+DEADLINE_STATE_DIR = os.path.join(ROOT, "data", "deadline_state")
+CALIBRATION_PATH = os.path.join(ROOT, "calibration.csv")
 
 CHIPS_THAT_SKIP_TRANSFER_DEDUCTION = {"wildcard", "freehit"}
 ELEMENT_SUMMARY_SLEEP_SECONDS = 0.2
@@ -111,12 +114,12 @@ TEAM_STRENGTH_WINDOW = 6
 
 # Bumping this forces a full cache refetch when the cached schema is missing fields
 # a newer version of this script needs (e.g. the team-strength inputs added later).
-CACHE_SCHEMA_VERSION = 3
+CACHE_SCHEMA_VERSION = 4
 
 # Fields kept per gameweek in the cache. Per-player stats only -- team metrics
 # come from the fixture list, not from aggregating these.
 HISTORY_FIELDS = (
-    "round", "minutes", "starts",
+    "round", "minutes", "starts", "total_points",
     "expected_goals", "expected_assists", "defensive_contribution", "bonus",
 )
 
@@ -1005,6 +1008,136 @@ def attach_league_ownership(records, per_league, overall, overall_total):
         record["rival_ownership"] = round(overall.get(pid, 0) / overall_total, 3) if overall_total else None
 
 
+def deadline_state_path(gameweek):
+    return os.path.join(DEADLINE_STATE_DIR, f"gw{gameweek}.json")
+
+
+def capture_deadline_state(gameweek, deadline, pool, now):
+    """Freeze what the model believed BEFORE the deadline.
+
+    Calibration has to grade the score the model actually stood behind at the
+    time, not one recomputed later against finished results -- that would be
+    marking its own homework with the answers in hand. Every run before the
+    deadline overwrites this file, so it converges on the last pre-deadline
+    view; once the deadline passes, gw_next advances and this gameweek's file
+    is never touched again.
+
+    Nothing is written at or after the deadline, so a post-deadline run cannot
+    contaminate the frozen state."""
+    if not gameweek or not deadline:
+        return None
+    deadline_dt = parse_iso(deadline)
+    if deadline_dt is None or now >= deadline_dt:
+        return None
+
+    os.makedirs(DEADLINE_STATE_DIR, exist_ok=True)
+    state = {
+        "gameweek": gameweek,
+        "deadline": deadline,
+        "captured_at": now.isoformat(),
+        "rank_weights": RANK_WEIGHTS,
+        "players": [
+            {
+                "player_id": p["player_id"], "name": p["name"], "club": p["club"],
+                "pos": p["pos"], "price": p["price"], "source": p["source"],
+                "rank_score": p["rank_score"], "rank_coverage": p.get("rank_coverage"),
+                "rank_basis": p.get("rank_basis") or [],
+                "rank_components": p.get("rank_components") or {},
+                "availability_penalty": p.get("availability_penalty"),
+            }
+            for p in pool
+        ],
+    }
+    with open(deadline_state_path(gameweek), "w") as f:
+        json.dump(state, f, separators=(",", ":"))
+    return state
+
+
+def parse_iso(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+CALIBRATION_COLUMNS = (
+    ["gameweek", "captured_at", "source", "player_id", "name", "club", "pos", "price",
+     "rank_score", "rank_coverage", "availability_penalty"]
+    + [f"z_{name}" for name in RANK_WEIGHTS]
+    + ["rank_basis", "minutes_played", "actual_points"]
+)
+
+
+def logged_gameweeks():
+    """Gameweeks already in calibration.csv, so a rerun appends nothing twice."""
+    if not os.path.exists(CALIBRATION_PATH):
+        return set()
+    with open(CALIBRATION_PATH, newline="") as f:
+        return {row["gameweek"] for row in csv.DictReader(f) if row.get("gameweek")}
+
+
+def scores_locked(event):
+    """FPL flips finished first and data_checked once bonus is applied and the
+    numbers are final, so data_checked is the one to wait for."""
+    return bool(event.get("data_checked", event.get("finished")))
+
+
+def append_calibration_rows(events, elements, cache, latest_finished_gw):
+    """Append one row per player per locked gameweek, joining the frozen
+    pre-deadline score to what actually happened.
+
+    Append-only: a gameweek already present is skipped rather than rewritten,
+    so history cannot be quietly revised."""
+    already = logged_gameweeks()
+    appended = {}
+    for event in events:
+        gameweek = event["id"]
+        if not scores_locked(event) or str(gameweek) in already:
+            continue
+        path = deadline_state_path(gameweek)
+        if not os.path.exists(path):
+            continue  # no pre-deadline capture exists; never reconstruct one
+        with open(path) as f:
+            state = json.load(f)
+
+        rows = []
+        for player in state["players"]:
+            # Players who have since left the watchlist are still graded, so the
+            # log is not silently restricted to those the model still likes.
+            history = fetch_player_history(player["player_id"], cache, latest_finished_gw)
+            played = [h for h in history if h.get("round") == gameweek]
+            row = {
+                "gameweek": gameweek,
+                "captured_at": state["captured_at"],
+                "source": player["source"],
+                "player_id": player["player_id"],
+                "name": player["name"],
+                "club": player["club"],
+                "pos": player["pos"],
+                "price": player["price"],
+                "rank_score": player["rank_score"],
+                "rank_coverage": player["rank_coverage"],
+                "availability_penalty": player["availability_penalty"],
+                "rank_basis": "|".join(player["rank_basis"]),
+                "minutes_played": sum(h.get("minutes") or 0 for h in played) if played else None,
+                "actual_points": sum(h.get("total_points") or 0 for h in played) if played else None,
+            }
+            for name in RANK_WEIGHTS:
+                row[f"z_{name}"] = player["rank_components"].get(name)
+            rows.append(row)
+
+        write_header = not os.path.exists(CALIBRATION_PATH)
+        with open(CALIBRATION_PATH, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=CALIBRATION_COLUMNS)
+            if write_header:
+                writer.writeheader()
+            writer.writerows(rows)
+        appended[gameweek] = len(rows)
+    return appended
+
+
 def build_transfer_options(my_squad, watchlist, bank, free_transfers):
     """Which upgrades you can actually afford right now.
 
@@ -1113,6 +1246,10 @@ def main():
 
     # Squad and watchlist are scored against the same distribution, so a player
     # you own is directly comparable with a transfer target.
+    for player in my_squad:
+        player["source"] = "squad"
+    for player in watchlist:
+        player["source"] = "watchlist"
     pool_stats = rank_players(my_squad + watchlist)
     sort_by_rank(watchlist)
 
@@ -1162,11 +1299,28 @@ def main():
         "data_maturity": data_maturity,
     }
 
+    # Freeze the pre-deadline view, then grade any gameweek whose scores have
+    # locked. Capture happens after scoring so the frozen state is the real one,
+    # and only ever before the deadline itself.
+    now = datetime.now(timezone.utc)
+    captured = capture_deadline_state(gw_next, next_deadline, my_squad + watchlist, now)
+    appended = append_calibration_rows(events, elements, cache, latest_finished_gw)
+    save_element_summary_cache(cache)
+
     with open(OUTPUT_PATH, "w") as f:
         json.dump(snapshot, f, separators=(",", ":"))
 
     size_bytes = os.path.getsize(OUTPUT_PATH)
     print(f"snapshot.json written: {size_bytes} bytes ({size_bytes / 1024:.2f} KB)")
+    if captured:
+        print(f"deadline state captured for GW{captured['gameweek']} "
+              f"({len(captured['players'])} players, deadline {captured['deadline']})")
+    else:
+        print(f"no deadline state captured (GW{gw_next} deadline {next_deadline} has passed or is unknown)")
+    for gameweek, count in sorted(appended.items()):
+        print(f"calibration.csv: appended {count} rows for GW{gameweek}")
+    if not appended:
+        print("calibration.csv: nothing new to append")
     if size_bytes > 500 * 1024:
         print("WARNING: snapshot exceeds 500KB target", file=sys.stderr)
         sys.exit(1)

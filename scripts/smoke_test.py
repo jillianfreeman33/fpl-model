@@ -71,6 +71,7 @@ BOOTSTRAP = {
     "elements": ELEMENTS, "teams": TEAMS,
     "element_types": [{"id": k, "singular_name_short": v} for k, v in POS.items()],
     "events": [{"id": g, "is_current": g == 2, "is_next": g == 3, "finished": g <= 1,
+                "data_checked": g <= 1,
                 "deadline_time": f"2026-09-{g:02d}T17:30:00Z"} for g in range(1, 8)],
 }
 MY_PICKS = [{"element": e["id"]} for e in ELEMENTS[:15]]
@@ -91,8 +92,9 @@ def fake_get(path, **params):
              "expected_goals": str(round(0.05 * (pid % 11), 3)),
              "expected_assists": str(round(0.03 * (pid % 7), 3)),
              "defensive_contribution": (pid % 13) + r,
-             "bonus": (pid + r) % 4}
-            for r in range(1, 3 + pid % 3)
+             "bonus": (pid + r) % 4,
+             "total_points": (pid + r) % 13}
+            for r in range(1, 4 + pid % 3)
         ]
         return {"history": rounds}
     if path.endswith("/history/"):
@@ -117,6 +119,8 @@ def main():
     s.ELEMENT_SUMMARY_SLEEP_SECONDS = 0
     s.OUTPUT_PATH = os.path.join(tmp, "snapshot.json")
     s.ELEMENT_SUMMARY_CACHE_PATH = os.path.join(tmp, "cache.json")
+    s.DEADLINE_STATE_DIR = os.path.join(tmp, "deadline_state")
+    s.CALIBRATION_PATH = os.path.join(tmp, "calibration.csv")
     real_sleep = s.time.sleep
     s.time.sleep = lambda *_: None
     try:
@@ -242,6 +246,63 @@ def main():
     check("affordable upgrades are position-legal and funded",
           all(o["bank_after"] >= 0 for o in opts["affordable_upgrades"]),
           f"{opts['affordable_upgrade_count']} options")
+
+    print("\ncalibration: freeze before the deadline, grade after the lock")
+    gw3 = os.path.join(s.DEADLINE_STATE_DIR, "gw3.json")
+    check("pre-deadline state captured for the upcoming GW", os.path.exists(gw3))
+    if os.path.exists(gw3):
+        state = json.load(open(gw3))
+        check("captured strictly before the deadline",
+              state["captured_at"] < state["deadline"],
+              f"{state['captured_at']} < {state['deadline']}")
+        check("captures squad and watchlist", len(state["players"]) == len(squad) + len(watch),
+              f"{len(state['players'])} players")
+        check("frozen rows carry score and components",
+              all("rank_score" in p and "rank_components" in p for p in state["players"]))
+
+    check("nothing logged yet -- GW1 has no pre-deadline capture",
+          not os.path.exists(s.CALIBRATION_PATH),
+          "correct: GW1 predates the model, never reconstructed")
+
+    # Lock GW3 and rerun: the frozen score should now be graded against reality.
+    for event in BOOTSTRAP["events"]:
+        if event["id"] == 3:
+            event["finished"] = event["data_checked"] = True
+        event["is_current"] = event["id"] == 3
+        event["is_next"] = event["id"] == 4
+    s.time.sleep = lambda *_: None
+    try:
+        s.main()
+    finally:
+        s.time.sleep = real_sleep
+
+    check("calibration.csv written once the GW locked", os.path.exists(s.CALIBRATION_PATH))
+    import csv as _csv
+    rows = list(_csv.DictReader(open(s.CALIBRATION_PATH, newline="")))
+    check("one row per frozen player", len(rows) == len(state["players"]), f"{len(rows)} rows")
+    check("columns match the schema", list(rows[0]) == s.CALIBRATION_COLUMNS if rows else False)
+    check("every rank component has its own column",
+          all(f"z_{n}" in rows[0] for n in s.RANK_WEIGHTS) if rows else False,
+          f"{len(s.RANK_WEIGHTS)} components")
+    check("actual outcomes joined on",
+          any(r["actual_points"] not in ("", None) for r in rows) if rows else False)
+    check("source distinguishes squad from watchlist",
+          {r["source"] for r in rows} == {"squad", "watchlist"} if rows else False)
+    frozen = {p["player_id"]: p["rank_score"] for p in state["players"]}
+    check("logged score is the FROZEN one, not recomputed",
+          all(r["rank_score"] == ("" if frozen[int(r["player_id"])] is None
+                                  else str(frozen[int(r["player_id"])])) for r in rows) if rows else False)
+
+    # Re-run again: append-only means no duplication.
+    before = len(rows)
+    s.time.sleep = lambda *_: None
+    try:
+        s.main()
+    finally:
+        s.time.sleep = real_sleep
+    rows2 = list(_csv.DictReader(open(s.CALIBRATION_PATH, newline="")))
+    check("re-running does not duplicate a logged gameweek",
+          len(rows2) == before, f"{before} -> {len(rows2)}")
 
     print(f"\n{'ALL SMOKE TESTS PASSED' if not failures else 'FAILURES: ' + ', '.join(failures)}")
     return 1 if failures else 0
