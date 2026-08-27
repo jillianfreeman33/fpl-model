@@ -449,6 +449,53 @@ def main():
           all({"rank_basis", "rank_components", "fixture"} <= set(p) for p in gw3_pred["players"]))
     check("records the weights the score was built with",
           gw3_pred["rank_weights"] == s.RANK_WEIGHTS)
+    check("records the shrinkage k the score was built under",
+          gw3_pred["rate_shrinkage_minutes"] == s.RATE_SHRINKAGE_MINUTES,
+          f"k={gw3_pred['rate_shrinkage_minutes']}")
+    check("records the positional priors used",
+          gw3_pred["rate_priors"] == snap["rate_priors"], f"{len(gw3_pred['rate_priors'])} priors")
+    check("records minutes and observed rates per player",
+          all({"minutes_total", "rate_shrinkage_weight", "rate_observed"} <= set(p)
+              for p in gw3_pred["players"]))
+
+    # The point of storing all that: a different k must be recomputable from the
+    # record alone, without re-running the season. Verify by reconstructing the
+    # shrunk value at the ORIGINAL k and checking it matches what was published.
+    k = gw3_pred["rate_shrinkage_minutes"]
+    priors = gw3_pred["rate_priors"]
+    live = {p["player_id"]: p for p in pool}
+    rebuilt, checked = True, 0
+    for rec in gw3_pred["players"]:
+        m = rec["minutes_total"]
+        if not m or not rec["rate_observed"]:
+            continue
+        w = m / (m + k)
+        for field, observed in rec["rate_observed"].items():
+            prior = priors.get(f"{field}|{rec['pos']}")
+            expected = round(w * observed + (1 - w) * prior, 2) if prior is not None \
+                else round(observed, 2)
+            if abs(live[rec["player_id"]][field] - expected) > 0.011:
+                rebuilt = False
+            checked += 1
+    check("a k-sweep is reconstructable from the record alone", rebuilt and checked > 0,
+          f"{checked} rate/player pairs rebuilt at k={k}")
+
+    # And that a DIFFERENT k actually moves the answer -- otherwise the stored
+    # inputs would be decoration.
+    moved = False
+    for rec in gw3_pred["players"]:
+        m = rec["minutes_total"]
+        if not m or "xg_per90" not in rec["rate_observed"]:
+            continue
+        prior = priors.get(f"xg_per90|{rec['pos']}")
+        if prior is None:
+            continue
+        w_alt = m / (m + 45)
+        if abs((w_alt * rec["rate_observed"]["xg_per90"] + (1 - w_alt) * prior)
+               - live[rec["player_id"]]["xg_per90"]) > 0.02:
+            moved = True
+    check("re-running at k=45 gives a different answer", moved,
+          "stored inputs are load-bearing, not decorative")
     check("GW1 and GW2 never reconstructed",
           "1" not in preds["gameweeks"] and "2" not in preds["gameweeks"],
           "no pre-deadline buffer existed for either")
@@ -479,6 +526,11 @@ def main():
           any(r["opponent"] for r in rows) if rows else False)
     check("eligibility at the deadline is logged",
           all(r["eligible"] in ("True", "False") for r in rows) if rows else False)
+    check("the shrinkage k is stamped on every calibration row",
+          all(r["rate_shrinkage_minutes"] == str(s.RATE_SHRINKAGE_MINUTES) for r in rows)
+          if rows else False, f"k={s.RATE_SHRINKAGE_MINUTES}")
+    check("minutes at the deadline are logged",
+          all(r["minutes_at_deadline"] != "" for r in rows) if rows else False)
 
     # Re-run again: append-only means no duplication, and the sealed prediction
     # must be byte-identical -- a record that can be revised is not a prediction.

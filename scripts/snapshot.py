@@ -295,18 +295,26 @@ def shrink_rate_stats(pool, priors):
         minutes = totals["minutes"]
         weight = minutes / (minutes + RATE_SHRINKAGE_MINUTES)
         player["rate_shrinkage_weight"] = round(weight, 3)
-        shrunk = {}
+        # The unshrunk rate is kept alongside the shrunk one. Shrinkage is
+        # lossy -- w*observed + (1-w)*prior cannot be inverted from the published
+        # figure alone once it has been z-scored -- so without this, changing
+        # RATE_SHRINKAGE_MINUTES later could never be tested against a gameweek
+        # already recorded. Keeping observed, prior and minutes makes any k
+        # recomputable from the record.
+        shrunk, observed_rates = {}, {}
         for field, (numerator, denominator) in RATE_STATS.items():
             base = totals[denominator]
             prior = priors.get(f"{field}|{player['pos']}")
             if not base:
                 continue  # no denominator (e.g. no appearances): leave as null
             observed = totals[numerator] / base
+            observed_rates[field] = round(observed, 4)
             if prior is None:
                 shrunk[field] = observed
             else:
                 shrunk[field] = weight * observed + (1 - weight) * prior
             player[field] = round(shrunk[field], 2)
+        player["rate_observed"] = observed_rates
 
         # Derived from the two shrunk components so the identity holds exactly.
         if "xg_per90" in shrunk and "xa_per90" in shrunk:
@@ -1209,7 +1217,7 @@ def club_fixture_for_gw(fixtures_next6, club, gameweek):
     return None
 
 
-def capture_deadline_state(gameweek, deadline, pool, fixtures_next6, now):
+def capture_deadline_state(gameweek, deadline, pool, fixtures_next6, rate_priors, now):
     """Freeze what the model believes BEFORE the deadline, into a working buffer.
 
     This file is deliberately mutable: every run before the deadline overwrites
@@ -1234,6 +1242,13 @@ def capture_deadline_state(gameweek, deadline, pool, fixtures_next6, now):
         "deadline": deadline,
         "captured_at": now.isoformat(),
         "rank_weights": RANK_WEIGHTS,
+        # Stamp the shrinkage settings the scores were built under. Without
+        # these, changing RATE_SHRINKAGE_MINUTES would silently redefine what
+        # every earlier prediction meant -- the log would look continuous while
+        # measuring two different things. Recorded, a change shows up as a
+        # labelled discontinuity instead.
+        "rate_shrinkage_minutes": RATE_SHRINKAGE_MINUTES,
+        "rate_priors": rate_priors,
         "players": [
             {
                 "player_id": p["player_id"], "name": p["name"], "club": p["club"],
@@ -1245,6 +1260,11 @@ def capture_deadline_state(gameweek, deadline, pool, fixtures_next6, now):
                 "eligible": p.get("eligible"),
                 "rank_fixture_proxy": p.get("rank_fixture_proxy"),
                 "fixture": club_fixture_for_gw(fixtures_next6, p["club"], gameweek),
+                # minutes + observed + the priors above are exactly what a
+                # different k would need; the shrunk figures alone are not.
+                "minutes_total": p.get("minutes_total"),
+                "rate_shrinkage_weight": p.get("rate_shrinkage_weight"),
+                "rate_observed": p.get("rate_observed") or {},
             }
             for p in pool
         ],
@@ -1296,6 +1316,8 @@ def seal_predictions(events, now):
             "captured_at": state["captured_at"],
             "sealed_at": now.isoformat(),
             "rank_weights": state.get("rank_weights", RANK_WEIGHTS),
+            "rate_shrinkage_minutes": state.get("rate_shrinkage_minutes"),
+            "rate_priors": state.get("rate_priors") or {},
             "players": state["players"],
         }
         sealed[gameweek] = len(state["players"])
@@ -1318,6 +1340,7 @@ def parse_iso(value):
 CALIBRATION_COLUMNS = (
     ["gameweek", "captured_at", "source", "player_id", "name", "club", "pos", "price",
      "opponent", "was_home", "eligible", "rank_fixture_proxy",
+     "minutes_at_deadline", "rate_shrinkage_minutes", "rate_shrinkage_weight",
      "rank_score", "rank_coverage", "availability_penalty"]
     + [f"z_{name}" for name in RANK_WEIGHTS]
     + ["rank_basis", "minutes_played", "actual_points"]
@@ -1421,6 +1444,12 @@ def append_calibration_rows(events, elements, cache, latest_finished_gw):
                 "was_home": fixture.get("is_home"),
                 "eligible": player.get("eligible"),
                 "rank_fixture_proxy": player.get("rank_fixture_proxy"),
+                # The k this row's score was built under, so a later change to
+                # RATE_SHRINKAGE_MINUTES is visible in the log as a break rather
+                # than quietly redefining the column.
+                "minutes_at_deadline": player.get("minutes_total"),
+                "rate_shrinkage_minutes": state.get("rate_shrinkage_minutes"),
+                "rate_shrinkage_weight": player.get("rate_shrinkage_weight"),
                 "rank_score": player["rank_score"],
                 "rank_coverage": player["rank_coverage"],
                 "availability_penalty": player["availability_penalty"],
@@ -1638,7 +1667,7 @@ def main():
     # real one, and only ever before the deadline itself.
     now = datetime.now(timezone.utc)
     captured = capture_deadline_state(
-        gw_next, next_deadline, my_squad + watchlist, fixtures_next6, now)
+        gw_next, next_deadline, my_squad + watchlist, fixtures_next6, rate_priors, now)
     sealed = seal_predictions(events, now)
     appended = append_calibration_rows(events, elements, cache, latest_finished_gw)
     save_element_summary_cache(cache)
