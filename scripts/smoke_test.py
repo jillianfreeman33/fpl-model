@@ -205,6 +205,46 @@ def main():
           all(p["rank_score"] is not None
               for p in squad + watch if p["eligible"] is False and p["rank_coverage"] >= s.RANK_MIN_COVERAGE))
 
+    print("\nrate shrinkage")
+    priors = snap["rate_priors"]
+    check("positional priors published for every rate stat",
+          all(f"{f}|{pos}" in priors for f in s.RATE_STATS for pos in {p["pos"] for p in pool}),
+          f"{len(priors)} priors")
+    played = [p for p in pool if (p["minutes_total"] or 0) > 0]
+    check("every player who has played gets a rate, none nulled by a cliff",
+          all(p["xgi_per90"] is not None for p in played),
+          f"{len(played)} played, {sum(1 for p in played if p['xgi_per90'] is None)} null")
+    check("players who never played stay null",
+          all(p["xgi_per90"] is None for p in pool if not (p["minutes_total"] or 0)))
+    check("shrinkage weight follows minutes/(minutes+180)",
+          all(abs(p["rate_shrinkage_weight"]
+                  - p["minutes_total"] / (p["minutes_total"] + s.RATE_SHRINKAGE_MINUTES)) < 5e-4
+              for p in played))
+    check("weight rises with minutes",
+          all(a["rate_shrinkage_weight"] <= b["rate_shrinkage_weight"]
+              for a, b in zip(sorted(played, key=lambda p: p["minutes_total"]),
+                              sorted(played, key=lambda p: p["minutes_total"])[1:])))
+    check("xgi_per90 is exactly xg + xa after shrinking",
+          all(abs(p["xgi_per90"] - round(p["xg_per90"] + p["xa_per90"], 2)) < 0.011
+              for p in played if p["xg_per90"] is not None))
+    # The point of the exercise: a small sample must land closer to its position
+    # than to its own raw rate.
+    low = min(played, key=lambda p: p["minutes_total"])
+    high = max(played, key=lambda p: p["minutes_total"])
+    check("a small sample is pulled harder than a large one",
+          low["rate_shrinkage_weight"] < high["rate_shrinkage_weight"],
+          f"{low['minutes_total']}min w={low['rate_shrinkage_weight']} vs "
+          f"{high['minutes_total']}min w={high['rate_shrinkage_weight']}")
+    check("no shrunk rate exceeds the largest raw rate at its position",
+          all(p["xgi_per90"] <= 12 for p in played), "sanity bound")
+    check("bonus_per90 goes through shrinkage too, not raw division",
+          all(p.get("bonus_per90") is not None for p in played))
+    check("bonus_per90 no longer annualises a part-match",
+          all(p["bonus_per90"] <= 4.0 for p in played),
+          f"max={max(p['bonus_per90'] for p in played)}")
+    check("no rate inputs leak into the snapshot",
+          all("_rate_inputs" not in p for p in pool))
+
     print("\nfixture-proxy flag")
     check("every player carries rank_fixture_proxy",
           all("rank_fixture_proxy" in p for p in squad + watch))

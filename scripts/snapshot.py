@@ -28,6 +28,33 @@ ELEMENT_SUMMARY_SLEEP_SECONDS = 0.2
 # DefCon 2pt threshold: 10 CBIT for defenders/keepers, 12 CBIRT for mids/forwards.
 DEFCON_THRESHOLD_BY_POS = {"GKP": 10, "DEF": 10, "MID": 12, "FWD": 12}
 
+# Rate stats are shrunk toward their positional mean by minutes played:
+#   w = minutes / (minutes + RATE_SHRINKAGE_MINUTES),  shrunk = w*raw + (1-w)*prior
+#
+# This replaces a hard "null below 90 minutes" cliff. The cliff did stop wild
+# rates, but bluntly and in both directions: at 89 minutes a player contributed
+# nothing at all, while at 90 he contributed a full-confidence rate off a single
+# match -- De Cuyper's 1.47 xG in 77 minutes annualises to 1.97 xGI/90, which
+# would have been the best figure in the pool by 60% and from one appearance.
+# Shrinkage makes the evidence continuous: 75 minutes counts for something, one
+# freak match counts for less than a season.
+#
+# 180 minutes = two full matches, so a player is believed half on his own record
+# at that point. bonus_per90 goes through the same path; it was the one per-90
+# with no guard at all, posting 4.29 for a player with 63 minutes.
+RATE_SHRINKAGE_MINUTES = 180
+
+# field -> (numerator, denominator) in the per-player rate inputs. xgi_per90 is
+# absent deliberately: it is derived from the two shrunk components afterwards so
+# it stays exactly xg + xa rather than being shrunk a second time.
+RATE_STATS = {
+    "xg_per90": ("xg", "nineties"),
+    "xa_per90": ("xa", "nineties"),
+    "defcon_per90": ("defcon", "nineties"),
+    "bonus_per90": ("bonus", "nineties"),
+    "defcon_hit_rate": ("hits", "apps"),
+}
+
 # rank_score weights, applied to component z-scores. Every quantity the snapshot
 # derives feeds the model through exactly one of these, so nothing is counted
 # twice: xg_per90 + xa_per90 are exactly xgi_per90; price enters via
@@ -194,36 +221,96 @@ def compute_player_stats(history, price, total_points, pos):
     bonus_total = sum(gw.get("bonus") or 0 for gw in history)
     points_per_million = round(total_points / price, 2) if price else None
 
-    # Guard every per-90/rate stat: under 90 minutes is too small a sample to
-    # extrapolate a rate from, so emit null rather than a wild number.
-    if minutes_total < 90:
-        xg_per90 = xa_per90 = xgi_per90 = defcon_per90 = defcon_hit_rate = None
-    else:
-        nineties = minutes_total / 90
-        xg_total = sum(float(gw.get("expected_goals") or 0) for gw in history)
-        xa_total = sum(float(gw.get("expected_assists") or 0) for gw in history)
-        defcon_total = sum(gw.get("defensive_contribution") or 0 for gw in history)
-        xg_per90 = round(xg_total / nineties, 2)
-        xa_per90 = round(xa_total / nineties, 2)
-        xgi_per90 = round(xg_per90 + xa_per90, 2)
-        defcon_per90 = round(defcon_total / nineties, 2)
-        threshold = DEFCON_THRESHOLD_BY_POS.get(pos, 12)
-        hits = sum(1 for gw in played if (gw.get("defensive_contribution") or 0) >= threshold)
-        defcon_hit_rate = round(hits / apps, 2)
+    # expected_goals/expected_assists arrive from the API as strings.
+    nineties = minutes_total / 90
+    threshold = DEFCON_THRESHOLD_BY_POS.get(pos, 12)
+    totals = {
+        "xg": sum(float(gw.get("expected_goals") or 0) for gw in history),
+        "xa": sum(float(gw.get("expected_assists") or 0) for gw in history),
+        "defcon": sum(gw.get("defensive_contribution") or 0 for gw in history),
+        "bonus": bonus_total,
+        "hits": sum(1 for gw in played
+                    if (gw.get("defensive_contribution") or 0) >= threshold),
+        "nineties": nineties,
+        "apps": apps,
+        "minutes": minutes_total,
+    }
+
+    # Raw, unshrunk rates. shrink_rate_stats replaces these with the shrunk
+    # figures once the whole pool is known, since the prior is positional and
+    # cannot be computed one player at a time. A player who has never played
+    # keeps null: shrinkage needs some evidence to shrink, and handing him the
+    # positional average would invent it.
+    def raw(numerator, denominator):
+        base = totals[denominator]
+        return round(totals[numerator] / base, 2) if base else None
 
     return {
         "minutes_total": minutes_total,
         "minutes_per_app": round(minutes_total / apps, 1) if apps else None,
         "starts": starts,
         "apps": apps,
-        "xg_per90": xg_per90,
-        "xa_per90": xa_per90,
-        "xgi_per90": xgi_per90,
-        "defcon_per90": defcon_per90,
-        "defcon_hit_rate": defcon_hit_rate,
+        "xg_per90": raw("xg", "nineties"),
+        "xa_per90": raw("xa", "nineties"),
+        "xgi_per90": round(totals["xg"] / nineties + totals["xa"] / nineties, 2) if nineties else None,
+        "defcon_per90": raw("defcon", "nineties"),
+        "defcon_hit_rate": raw("hits", "apps"),
+        "bonus_per90": raw("bonus", "nineties"),
         "points_per_million": points_per_million,
         "bonus_total": bonus_total,
+        "rate_shrinkage_weight": None,
+        "_rate_inputs": totals,
     }
+
+
+def build_rate_priors(pool):
+    """Positional priors for each rate stat, as population rates.
+
+    Deliberately a minutes-weighted rate -- the position's total xG over the
+    position's total 90s -- not the mean of the individual per-90 figures. A
+    plain mean would let a player with one appearance and a freak rate drag the
+    prior toward himself with the same force as a player with a full season,
+    which is precisely the distortion the prior exists to correct."""
+    priors = {}
+    for pos in {p["pos"] for p in pool}:
+        at_pos = [p["_rate_inputs"] for p in pool if p["pos"] == pos and p.get("_rate_inputs")]
+        for field, (numerator, denominator) in RATE_STATS.items():
+            base = sum(r[denominator] for r in at_pos)
+            priors[f"{field}|{pos}"] = (
+                round(sum(r[numerator] for r in at_pos) / base, 4) if base else None
+            )
+    return priors
+
+
+def shrink_rate_stats(pool, priors):
+    """Pull each player's rates toward his position by how much he has played.
+
+    Applied after the pool is assembled, because the prior is a property of the
+    position rather than of any one player."""
+    for player in pool:
+        totals = player.pop("_rate_inputs", None)
+        if not totals or not totals["minutes"]:
+            continue  # never played: nothing to shrink, rates stay null
+
+        minutes = totals["minutes"]
+        weight = minutes / (minutes + RATE_SHRINKAGE_MINUTES)
+        player["rate_shrinkage_weight"] = round(weight, 3)
+        shrunk = {}
+        for field, (numerator, denominator) in RATE_STATS.items():
+            base = totals[denominator]
+            prior = priors.get(f"{field}|{player['pos']}")
+            if not base:
+                continue  # no denominator (e.g. no appearances): leave as null
+            observed = totals[numerator] / base
+            if prior is None:
+                shrunk[field] = observed
+            else:
+                shrunk[field] = weight * observed + (1 - weight) * prior
+            player[field] = round(shrunk[field], 2)
+
+        # Derived from the two shrunk components so the identity holds exactly.
+        if "xg_per90" in shrunk and "xa_per90" in shrunk:
+            player["xgi_per90"] = round(shrunk["xg_per90"] + shrunk["xa_per90"], 2)
 
 
 def player_record(el, teams_by_id, types_by_id, player_stats):
@@ -737,8 +824,6 @@ def derive_rank_inputs(player):
     starts_rate and bonus_per90. selling_price is a verbatim copy of price and
     carries no independent signal."""
     apps = player.get("apps") or 0
-    minutes_total = player.get("minutes_total") or 0
-    nineties = minutes_total / 90 if minutes_total else 0
     net = player.get("net_transfers")
     return {
         "xgi_per90": player.get("xgi_per90"),
@@ -751,8 +836,9 @@ def derive_rank_inputs(player):
         "form": player.get("form"),
         "defcon_per90": player.get("defcon_per90"),
         "defcon_hit_rate": player.get("defcon_hit_rate"),
-        "bonus_per90": round(player["bonus_total"] / nineties, 3)
-        if nineties and player.get("bonus_total") is not None else None,
+        # Shrunk in shrink_rate_stats alongside the other rates; it used to be
+        # re-derived raw here, which is why a 63-minute player posted 4.29.
+        "bonus_per90": player.get("bonus_per90"),
         "net_transfers": net,
         "rival_ownership": player.get("rival_ownership"),
         "ownership": player.get("ownership"),
@@ -829,8 +915,7 @@ def rank_players(pool):
         values["pos"] = player["pos"]
         inputs.append(values)
         # Surface the derived quantities so the score stays auditable.
-        player.update({k: values[k] for k in
-                       ("starts_rate", "bonus_per90", "availability", "eligible")})
+        player.update({k: values[k] for k in ("starts_rate", "availability", "eligible")})
 
     pool_stats = compute_pool_stats(inputs, RANK_WEIGHTS.keys(), POSITION_RELATIVE_COMPONENTS)
     for player, values in zip(pool, inputs):
@@ -1433,6 +1518,7 @@ def main():
         "minutes_total": None, "minutes_per_app": None, "starts": None, "apps": None,
         "xg_per90": None, "xa_per90": None, "xgi_per90": None, "defcon_per90": None,
         "defcon_hit_rate": None, "points_per_million": None, "bonus_total": None,
+        "bonus_per90": None, "rate_shrinkage_weight": None,
         "fixture_score": None, "fdr_next3": None, "fdr_next1": None,
         "rival_ownership": None, "league_ownership": None,
     }
@@ -1454,6 +1540,11 @@ def main():
     attach_player_stats(my_squad, elements, cache, latest_finished_gw)
     attach_player_stats(watchlist, elements, cache, latest_finished_gw)
     save_element_summary_cache(cache)
+
+    # Rates are shrunk toward their positional prior across the whole pool at
+    # once, so squad and watchlist are measured against the same yardstick.
+    rate_priors = build_rate_priors(my_squad + watchlist)
+    shrink_rate_stats(my_squad + watchlist, rate_priors)
 
     attach_fixture_scores(my_squad, fixtures_next6, team_strength)
     attach_fixture_scores(watchlist, fixtures_next6, team_strength)
@@ -1523,6 +1614,8 @@ def main():
         "my_squad": my_squad,
         "watchlist": watchlist,
         "watchlist_rank_stats": pool_stats,
+        "rate_priors": rate_priors,
+        "rate_shrinkage_minutes": RATE_SHRINKAGE_MINUTES,
         "watchlist_selection": watchlist_selection,
         "rank_weights": RANK_WEIGHTS,
         "transfer_options": transfer_options,
