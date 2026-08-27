@@ -263,10 +263,47 @@ def main():
     check("_xg_available reported", "_xg_available" in ts, str(ts.get("_xg_available")))
 
     print("\nno component silently inert")
+    declared = snap["inert_components"]
     for name in s.RANK_WEIGHTS:
         vals = {p["rank_components"].get(name) for p in squad + watch if p.get("rank_components")}
         vals.discard(None)
-        check(f"{name} varies", len(vals) > 1, f"{len(vals)} distinct")
+        # A component may legitimately say nothing -- but it must SAY that it is
+        # saying nothing. Silent deadness is the failure being guarded against.
+        check(f"{name} varies or is declared inert", len(vals) > 1 or name in declared,
+              f"{len(vals)} distinct" + ("" if len(vals) > 1 else " -- declared inert"))
+
+    print("\ndefcon is threshold-aware")
+    for pos, threshold in s.DEFCON_THRESHOLD_BY_POS.items():
+        group = [p for p in pool if p["pos"] == pos and p.get("defcon_per90") is not None]
+        if not group:
+            continue
+        check(f"{pos}: surplus is max(0, rate - {threshold})",
+              all(abs(p["defcon_surplus_per90"] - max(0.0, p["defcon_per90"] - threshold)) < 5e-3
+                  for p in group), f"n={len(group)}")
+        below = [p for p in group if p["defcon_per90"] < threshold]
+        check(f"{pos}: sub-threshold volume scores zero regardless of size",
+              len({p["defcon_surplus_per90"] for p in below}) <= 1,
+              f"{len(below)} below the bar, all at "
+              f"{below[0]['defcon_surplus_per90'] if below else 'n/a'}")
+
+    print("\nnear-constant components cannot explode")
+    # Direct check on the guard: one outlier against an otherwise identical field
+    # is the shape that produced a +4.90 sigma defender and a -7.01 availability.
+    spike = [0.0] * 24 + [0.47]
+    stats = s._mean_std(spike)
+    check("a 24-of-25 constant field is flagged inert", stats["inert"],
+          f"std={stats['std']} but IQR=0")
+    check("and z-scores to 0 rather than +4.9 sigma",
+          s.zscore(0.47, stats) == 0.0,
+          f"unguarded would be {(0.47 - stats['mean']) / stats['std']:+.2f}")
+    graded = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    check("a genuinely graded field stays live", not s._mean_std(graded)["inert"])
+    check("guard does not silence real spread",
+          abs(s.zscore(8.0, s._mean_std(graded))) > 1.0)
+
+    zmax = max((abs(v) for p in pool for v in (p.get("rank_components") or {}).values()
+                if v is not None), default=0)
+    check("no component z exceeds a sane bound", zmax < 4.0, f"max |z| = {zmax:.2f}")
 
     print("\nweights")
     check("all weights positive", all(w > 0 for w in s.RANK_WEIGHTS.values()))

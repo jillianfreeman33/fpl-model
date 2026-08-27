@@ -28,6 +28,24 @@ ELEMENT_SUMMARY_SLEEP_SECONDS = 0.2
 # DefCon 2pt threshold: 10 CBIT for defenders/keepers, 12 CBIRT for mids/forwards.
 DEFCON_THRESHOLD_BY_POS = {"GKP": 10, "DEF": 10, "MID": 12, "FWD": 12}
 
+# A component is inert -- z 0 for everyone in the group -- when at least half of
+# that group shares a single value, i.e. the interquartile range is zero.
+#
+# Raw defcon_per90 was scored as linear volume, but DefCon points are only paid
+# for CROSSING the per-match threshold. No forward in the pool has ever scored
+# one, yet the term still spread the eleven of them across 2.9 standard
+# deviations on volume alone: Wissa banked +1.32 and Isak was docked -1.24 for
+# actions worth nothing. Scoring the surplus ABOVE the threshold makes
+# sub-threshold volume worth exactly zero, which is what it is worth.
+#
+# The hinge alone would have swapped one fault for another. It sends 24 of 25
+# defenders to zero and leaves one above the line, and z-scoring a field that is
+# almost all one value explodes -- Mendy came out at +4.90 sigma, the same
+# pathology that once made a 50% fitness doubt worth -7 sigma. A near-constant
+# component answers "who is the odd one out", not "who is better", so the guard
+# makes it answer nothing.
+INERT_COMPONENT_IQR = 0.0
+
 # Rate stats are shrunk toward their positional mean by minutes played:
 #   w = minutes / (minutes + RATE_SHRINKAGE_MINUTES),  shrunk = w*raw + (1-w)*prior
 #
@@ -69,7 +87,7 @@ RANK_WEIGHTS = {
     "fdr_next1": 0.5,          # opponent difficulty, the very next game
     "points_per_million": 1.0, # value for money
     "form": 1.5,               # FPL's own recent-points form
-    "defcon_per90": 1.0,       # defensive contribution volume
+    "defcon_surplus_per90": 1.0,  # defensive volume ABOVE the scoring threshold
     "defcon_hit_rate": 0.5,    # share of appearances hitting the DefCon threshold
     "bonus_per90": 1.0,        # bonus point accrual
     "net_transfers": 0.5,      # market momentum / price-change pressure
@@ -90,7 +108,7 @@ AVAILABILITY_PENALTY = 1.0
 # sides of the opponent (attack for GKP/DEF, defence for MID/FWD) and land in
 # disjoint ranges; DefCon thresholds differ by position by rule.
 POSITION_RELATIVE_COMPONENTS = {"fixture_score", "fdr_next3", "fdr_next1",
-                                "defcon_per90", "defcon_hit_rate"}
+                                "defcon_surplus_per90", "defcon_hit_rate"}
 
 # Components where a lower raw value is better, so their z is negated. Kept
 # separate from the weights so every weight stays positive -- a negative weight
@@ -781,18 +799,33 @@ def _mean_std(values):
         "mean": round(statistics.fmean(values), 4) if values else 0.0,
         "std": round(statistics.pstdev(values), 4) if len(values) > 1 else 0.0,
         "n": len(values),
+        "inert": _is_inert(values),
     }
+
+
+def _is_inert(values):
+    """True when at least half the group shares one value.
+
+    Uses the interquartile range rather than the standard deviation because the
+    dangerous shape is not "no spread" but "no spread plus one outlier": a
+    handful of players adrift from an otherwise identical field produces a small
+    std and therefore an enormous z. The IQR ignores the tails, so it reports
+    what the middle of the distribution actually looks like."""
+    if len(values) < 4:
+        return len(set(values)) <= 1
+    q1, _, q3 = statistics.quantiles(values, n=4)
+    return (q3 - q1) <= INERT_COMPONENT_IQR
 
 
 def lookup_stats(pool_stats, name, pos, position_relative):
     key = (name, pos) if name in position_relative else name
-    return pool_stats.get(key) or {"mean": 0.0, "std": 0.0, "n": 0}
+    return pool_stats.get(key) or {"mean": 0.0, "std": 0.0, "n": 0, "inert": True}
 
 
 def zscore(value, stats):
     if value is None:
         return None
-    if stats["std"] == 0:
+    if stats["std"] == 0 or stats.get("inert"):
         return 0.0
     return (value - stats["mean"]) / stats["std"]
 
@@ -831,6 +864,20 @@ def eligible(player):
     return True
 
 
+def defcon_surplus(player):
+    """Defensive volume above the threshold that actually pays points.
+
+    A forward averaging 5.6 defensive actions per 90 against a 12-action bar has
+    not earned a fraction of a DefCon point -- he has earned none, exactly as a
+    forward averaging 3.2 has. Subtracting the threshold and flooring at zero
+    makes the model say that, where the raw rate said one was 2.5 sigma better
+    than the other."""
+    rate = player.get("defcon_per90")
+    if rate is None:
+        return None
+    return round(max(0.0, rate - DEFCON_THRESHOLD_BY_POS.get(player["pos"], 12)), 3)
+
+
 def derive_rank_inputs(player):
     """The raw quantities rank_score is built from, one per component.
 
@@ -850,7 +897,9 @@ def derive_rank_inputs(player):
         "fdr_next1": player.get("fdr_next1"),
         "points_per_million": player.get("points_per_million"),
         "form": player.get("form"),
-        "defcon_per90": player.get("defcon_per90"),
+        # Only volume above the per-match threshold can turn into points, so
+        # that is what gets scored. The raw rate stays on the record for display.
+        "defcon_surplus_per90": defcon_surplus(player),
         "defcon_hit_rate": player.get("defcon_hit_rate"),
         # Shrunk in shrink_rate_stats alongside the other rates; it used to be
         # re-derived raw here, which is why a 63-minute player posted 4.29.
@@ -931,12 +980,31 @@ def rank_players(pool):
         values["pos"] = player["pos"]
         inputs.append(values)
         # Surface the derived quantities so the score stays auditable.
-        player.update({k: values[k] for k in ("starts_rate", "availability", "eligible")})
+        player.update({k: values[k] for k in
+                       ("starts_rate", "availability", "eligible", "defcon_surplus_per90")})
 
     pool_stats = compute_pool_stats(inputs, RANK_WEIGHTS.keys(), POSITION_RELATIVE_COMPONENTS)
     for player, values in zip(pool, inputs):
         player.update(compute_rank(values, player["pos"], pool_stats))
     return {(f"{k[0]}|{k[1]}" if isinstance(k, tuple) else k): v for k, v in pool_stats.items()}
+
+
+def inert_components(pool_stats):
+    """Which components are currently saying nothing, and for whom.
+
+    A dead term is not neutral -- it silently converts a weighted signal into a
+    weight that only dilutes. starts_rate has been inert all season with nobody
+    told. Reporting it makes the difference between "this component says these
+    players are equal" and "this component is not working" visible."""
+    report = {}
+    for key, stats in pool_stats.items():
+        if not (stats["std"] == 0 or stats.get("inert")):
+            continue
+        name, group = key if isinstance(key, tuple) else (key, "ALL")
+        report.setdefault(name, []).append(
+            {"group": group, "n": stats["n"],
+             "reason": "zero variance" if stats["std"] == 0 else "near-constant (IQR 0)"})
+    return report
 
 
 def sort_by_rank(players):
@@ -1600,6 +1668,8 @@ def main():
     for player in watchlist:
         player["source"] = "watchlist"
     pool_stats = rank_players(my_squad + watchlist)
+    inert_report = inert_components(
+        {tuple(k.split("|")) if "|" in k else k: v for k, v in pool_stats.items()})
     sort_by_rank(watchlist)
 
     # Informational only, and applied after every score above is already final.
@@ -1651,6 +1721,7 @@ def main():
         "my_squad": my_squad,
         "watchlist": watchlist,
         "watchlist_rank_stats": pool_stats,
+        "inert_components": inert_report,
         "rate_priors": rate_priors,
         "rate_shrinkage_minutes": RATE_SHRINKAGE_MINUTES,
         "watchlist_selection": watchlist_selection,
@@ -1708,6 +1779,13 @@ def main():
             print(f"  {p['name']:<20} {p['club']:<4} {p['pos']:<4} "
                   f"rank_score={p['rank_score']} coverage={p['rank_coverage']} "
                   f"source={p['source']} basis={','.join(p['rank_basis'])}")
+
+    if inert_report:
+        print(f"\n{len(inert_report)} component(s) currently inert -- contributing nothing:")
+        for name, groups in sorted(inert_report.items()):
+            for g in groups:
+                print(f"  {name:<22} {g['group']:<4} n={g['n']:<3} {g['reason']} "
+                      f"(weight {RANK_WEIGHTS[name]})")
 
     ineligible = [p for p in all_watched_players if p.get("eligible") is False]
     if ineligible:
