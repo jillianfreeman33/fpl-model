@@ -143,6 +143,8 @@ EUROPEAN_MAX_LOOKBACK_DAYS = 14
 
 # Rolling team-strength window, and the prior it blends with early in the season.
 TEAM_STRENGTH_WINDOW = 6
+# A club's opponents at one venue are, by definition, at the other one.
+OPPOSITE_VENUE = {"home": "away", "away": "home"}
 # League anchors are MEASURED from this season's played fixtures, never guessed.
 # They are computed league-wide (every club, both venues), so they depend on real
 # results only -- not on which players are being tracked. With few matches played
@@ -554,8 +556,13 @@ def build_team_strength(fixtures, teams_by_id, elements):
             prior_weight = round(1 - rolling_weight, 3)
             strength = relative_strength(team[f"strength_overall_{venue}"] or 0, fpl_means[venue])
             anchor = anchors[venue]
+            # What a club CONCEDES at a venue is what its opponents SCORE there,
+            # and its opponents are at the other venue. Reading concessions off
+            # this venue's own scoring rate had every club conceding more at home
+            # (2.23/match) than away (0.97) -- home advantage upside down.
+            opponent_anchor = anchors[OPPOSITE_VENUE[venue]]
 
-            if anchor is None:
+            if anchor is None or opponent_anchor is None:
                 # Nothing played at this venue league-wide: no measured scale exists.
                 club_result[venue] = {
                     "goals_for_per_match": None, "goals_against_per_match": None,
@@ -566,7 +573,8 @@ def build_team_strength(fixtures, teams_by_id, elements):
                 continue
 
             prior_goals_for = anchor["goals_per_match"] * strength
-            prior_goals_against = anchor["goals_per_match"] / strength if strength else anchor["goals_per_match"]
+            prior_goals_against = (opponent_anchor["goals_per_match"] / strength
+                                   if strength else opponent_anchor["goals_per_match"])
             prior_clean_sheet = min(anchor["clean_sheet_rate"] * strength, 1.0)
 
             def blend(rolling_value, prior_value):

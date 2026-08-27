@@ -284,6 +284,43 @@ def main():
           all(abs(p["availability_penalty"] - s.AVAILABILITY_PENALTY * (1 - p["availability"])) < 1e-9
               for p in doubtful), f"n={len(doubtful)}")
 
+    print("\nhome advantage points the right way")
+    clubs = [c for c in ts if not c.startswith("_")]
+    def venue_mean(field, venue):
+        vals = [ts[c][venue][field] for c in clubs if ts[c][venue].get(field) is not None]
+        return sum(vals) / len(vals) if vals else None
+    gf_h, gf_a = venue_mean("goals_for_per_match", "home"), venue_mean("goals_for_per_match", "away")
+    ga_h, ga_a = venue_mean("goals_against_per_match", "home"), venue_mean("goals_against_per_match", "away")
+    check("clubs score more at home than away", gf_h > gf_a, f"{gf_h:.2f} vs {gf_a:.2f}")
+    # The inverted one: concessions were read off the club's OWN venue scoring
+    # rate, so every club appeared to concede more at home than away.
+    check("clubs concede FEWER goals at home than away", ga_h < ga_a,
+          f"home {ga_h:.2f} vs away {ga_a:.2f}")
+    check("home concessions match the away scoring scale",
+          abs(ga_h - gf_a) < 0.6 * max(gf_a, 0.1), f"conceded at home {ga_h:.2f}, scored away {gf_a:.2f}")
+    check("clubs keep more clean sheets at home",
+          venue_mean("clean_sheet_rate", "home") > venue_mean("clean_sheet_rate", "away"))
+
+    # The consequence that surfaced it: for attackers, a home fixture must not
+    # score as harder than an away one purely for being at home.
+    f6 = snap["fixtures_next6"]
+    homes = {c: sum(1 for f in v[:6] if f["is_home"]) for c, v in f6.items()}
+    for pos in ("MID", "FWD", "DEF", "GKP"):
+        rows = [(homes[p["club"]], p["fixture_score"]) for p in pool
+                if p["pos"] == pos and p.get("fixture_score") is not None]
+        buckets = {}
+        for h, fs in rows:
+            buckets.setdefault(h, []).append(fs)
+        if len(buckets) < 2:
+            continue
+        lo, hi = min(buckets), max(buckets)
+        mean_lo = sum(buckets[lo]) / len(buckets[lo])
+        mean_hi = sum(buckets[hi]) / len(buckets[hi])
+        # fixture_score: lower is better, so more home games must not raise it.
+        check(f"{pos}: more home games do not make fixtures look harder",
+              mean_hi <= mean_lo + 0.05,
+              f"{lo} home -> {mean_lo:+.3f}, {hi} home -> {mean_hi:+.3f}")
+
     print("\nxG is blended, not raw")
     xgs = [ts[c][v]["xg_for_per_match"] for c in ts if not c.startswith("_")
            for v in ("home", "away") if ts[c][v].get("xg_for_per_match") is not None]
