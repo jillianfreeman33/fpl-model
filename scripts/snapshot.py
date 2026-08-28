@@ -100,8 +100,15 @@ RANK_WEIGHTS = {
     "defcon_hit_rate": 0.5,    # share of appearances hitting the DefCon threshold
     "bonus_per90": 1.0,        # bonus point accrual
     "net_transfers": 0.5,      # market momentum / price-change pressure
-    "rival_ownership": 0.5,    # how many of your league rivals already own them
-    "ownership": 0.5,          # inverted below: tilt toward differentials
+    # Differential tilt, measured against the people you actually play. This was
+    # two terms at 0.5 pulling opposite ways: global ownership inverted
+    # (differential) against rival ownership uninverted (hedging). They correlate
+    # at -0.90, so they cancelled -- the net spread collapsed from 0.50 to 0.22
+    # and what survived was residual noise rather than a preference. One term
+    # now carries the whole 1.0, and it reads the two mini-leagues rather than
+    # the global game: you are chasing in both (12th of 20, 3rd of 7), and you
+    # do not catch anyone by owning what they already own.
+    "rival_ownership": 1.0,
 }
 
 # Availability is deliberately NOT a z-scored component. Almost every player sits
@@ -122,7 +129,7 @@ POSITION_RELATIVE_COMPONENTS = {"fixture_score", "fdr_next3", "fdr_next1",
 # Components where a lower raw value is better, so their z is negated. Kept
 # separate from the weights so every weight stays positive -- a negative weight
 # would corrupt both the denominator and the coverage fraction.
-LOWER_IS_BETTER = {"fixture_score", "fdr_next3", "fdr_next1", "ownership"}
+LOWER_IS_BETTER = {"fixture_score", "fdr_next3", "fdr_next1", "rival_ownership"}
 
 # Refuse to rank a player carrying less than this share of the total weight in
 # actual data -- below it the score says more about what is missing than about
@@ -915,7 +922,6 @@ def derive_rank_inputs(player):
         "bonus_per90": player.get("bonus_per90"),
         "net_transfers": net,
         "rival_ownership": player.get("rival_ownership"),
-        "ownership": player.get("ownership"),
         "availability": availability(player),
         "eligible": eligible(player),
     }

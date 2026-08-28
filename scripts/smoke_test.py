@@ -351,8 +351,24 @@ def main():
 
     print("\nweights")
     check("all weights positive", all(w > 0 for w in s.RANK_WEIGHTS.values()))
-    check("14 z-scored components", len(s.RANK_WEIGHTS) == 14, str(len(s.RANK_WEIGHTS)))
+    check("13 z-scored components", len(s.RANK_WEIGHTS) == 13, str(len(s.RANK_WEIGHTS)))
     check("availability is not z-scored", "availability" not in s.RANK_WEIGHTS)
+
+    print("\ndifferential tilt is one term, not two that cancel")
+    check("global ownership no longer scores", "ownership" not in s.RANK_WEIGHTS)
+    check("rival ownership carries the differential", "rival_ownership" in s.LOWER_IS_BETTER,
+          f"weight {s.RANK_WEIGHTS['rival_ownership']}")
+    check("global ownership survives as display data",
+          all("ownership" in p for p in pool))
+    # The cancellation being removed: high rival ownership must now cost, not pay.
+    owned = [(p["rival_ownership"], p["rank_components"]["rival_ownership"])
+             for p in pool if p.get("rival_ownership") is not None
+             and p["rank_components"].get("rival_ownership") is not None]
+    if len({r for r, _ in owned}) > 1:
+        hi = max(owned)[1]
+        lo_ = min(owned)[1]
+        check("the most rival-owned player is penalised, the least rewarded",
+              hi < 0 < lo_, f"most-owned z={hi:+.2f}, least-owned z={lo_:+.2f}")
 
     print("\navailability penalty is bounded")
     pen = [p["availability_penalty"] for p in squad + watch if p.get("availability_penalty") is not None]
