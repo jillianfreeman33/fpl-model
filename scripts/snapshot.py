@@ -71,6 +71,15 @@ RATE_STATS = {
     "defcon_per90": ("defcon", "nineties"),
     "bonus_per90": ("bonus", "nineties"),
     "defcon_hit_rate": ("hits", "apps"),
+    # Threshold FIRST, shrink second. Subtracting the threshold from an
+    # already-shrunk rate cancelled the term: shrinkage pulls everyone toward a
+    # positional mean that is by construction below the bar, so a midfielder who
+    # genuinely cleared 12 (Stach, 16.00 raw, hit rate 0.50) shrank to 11.27 and
+    # read as zero surplus. 15 of 74 players cleared the bar on their real
+    # numbers; exactly one survived to show it. Hinging the raw rate and then
+    # shrinking the surplus keeps both properties -- sub-threshold volume is
+    # worth nothing, and a small sample is still pulled toward its position.
+    "defcon_surplus_per90": ("defcon_surplus", "nineties"),
 }
 
 # rank_score weights, applied to component z-scores. Every quantity the snapshot
@@ -251,6 +260,12 @@ def compute_player_stats(history, price, total_points, pos):
         "bonus": bonus_total,
         "hits": sum(1 for gw in played
                     if (gw.get("defensive_contribution") or 0) >= threshold),
+        # Per-match surplus, summed: only actions beyond the threshold in a match
+        # they actually cleared can become points. Measured match by match rather
+        # than off the season average, so a single big game is not diluted by the
+        # quiet ones into looking like it never happened.
+        "defcon_surplus": sum(max(0, (gw.get("defensive_contribution") or 0) - threshold)
+                              for gw in played),
         "nineties": nineties,
         "apps": apps,
         "minutes": minutes_total,
@@ -274,6 +289,7 @@ def compute_player_stats(history, price, total_points, pos):
         "xa_per90": raw("xa", "nineties"),
         "xgi_per90": round(totals["xg"] / nineties + totals["xa"] / nineties, 2) if nineties else None,
         "defcon_per90": raw("defcon", "nineties"),
+        "defcon_surplus_per90": raw("defcon_surplus", "nineties"),
         "defcon_hit_rate": raw("hits", "apps"),
         "bonus_per90": raw("bonus", "nineties"),
         "points_per_million": points_per_million,
@@ -864,20 +880,6 @@ def eligible(player):
     return True
 
 
-def defcon_surplus(player):
-    """Defensive volume above the threshold that actually pays points.
-
-    A forward averaging 5.6 defensive actions per 90 against a 12-action bar has
-    not earned a fraction of a DefCon point -- he has earned none, exactly as a
-    forward averaging 3.2 has. Subtracting the threshold and flooring at zero
-    makes the model say that, where the raw rate said one was 2.5 sigma better
-    than the other."""
-    rate = player.get("defcon_per90")
-    if rate is None:
-        return None
-    return round(max(0.0, rate - DEFCON_THRESHOLD_BY_POS.get(player["pos"], 12)), 3)
-
-
 def derive_rank_inputs(player):
     """The raw quantities rank_score is built from, one per component.
 
@@ -889,7 +891,13 @@ def derive_rank_inputs(player):
     apps = player.get("apps") or 0
     net = player.get("net_transfers")
     return {
-        "xgi_per90": player.get("xgi_per90"),
+        # Attacking output is pooled across positions on purpose, so a forward's
+        # real advantage over a defender still counts. That reasoning does not
+        # reach goalkeepers: a keeper's xGI is structurally zero, so the term can
+        # only ever be a flat penalty -- all three sat at z -2.29, costing 0.42
+        # of rank_score each while telling you nothing about which keeper is
+        # better. Excluded rather than scored, so their coverage honestly falls.
+        "xgi_per90": None if player["pos"] == "GKP" else player.get("xgi_per90"),
         "minutes_per_app": player.get("minutes_per_app"),
         "starts_rate": round(player["starts"] / apps, 3) if apps and player.get("starts") is not None else None,
         "fixture_score": player.get("fixture_score"),
@@ -897,9 +905,10 @@ def derive_rank_inputs(player):
         "fdr_next1": player.get("fdr_next1"),
         "points_per_million": player.get("points_per_million"),
         "form": player.get("form"),
-        # Only volume above the per-match threshold can turn into points, so
-        # that is what gets scored. The raw rate stays on the record for display.
-        "defcon_surplus_per90": defcon_surplus(player),
+        # Only volume above the per-match threshold can turn into points. The
+        # surplus is hinged per match on raw data and shrunk like any other rate
+        # (see RATE_STATS); the unhinged rate stays on the record for display.
+        "defcon_surplus_per90": player.get("defcon_surplus_per90"),
         "defcon_hit_rate": player.get("defcon_hit_rate"),
         # Shrunk in shrink_rate_stats alongside the other rates; it used to be
         # re-derived raw here, which is why a 63-minute player posted 4.29.
@@ -981,7 +990,7 @@ def rank_players(pool):
         inputs.append(values)
         # Surface the derived quantities so the score stays auditable.
         player.update({k: values[k] for k in
-                       ("starts_rate", "availability", "eligible", "defcon_surplus_per90")})
+                       ("starts_rate", "availability", "eligible")})
 
     pool_stats = compute_pool_stats(inputs, RANK_WEIGHTS.keys(), POSITION_RELATIVE_COMPONENTS)
     for player, values in zip(pool, inputs):
@@ -1622,7 +1631,8 @@ def main():
     empty_stats = {
         "minutes_total": None, "minutes_per_app": None, "starts": None, "apps": None,
         "xg_per90": None, "xa_per90": None, "xgi_per90": None, "defcon_per90": None,
-        "defcon_hit_rate": None, "points_per_million": None, "bonus_total": None,
+        "defcon_hit_rate": None, "defcon_surplus_per90": None,
+        "points_per_million": None, "bonus_total": None,
         "bonus_per90": None, "rate_shrinkage_weight": None,
         "fixture_score": None, "fdr_next3": None, "fdr_next1": None,
         "rival_ownership": None, "league_ownership": None,

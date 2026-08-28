@@ -272,19 +272,63 @@ def main():
         check(f"{name} varies or is declared inert", len(vals) > 1 or name in declared,
               f"{len(vals)} distinct" + ("" if len(vals) > 1 else " -- declared inert"))
 
-    print("\ndefcon is threshold-aware")
-    for pos, threshold in s.DEFCON_THRESHOLD_BY_POS.items():
-        group = [p for p in pool if p["pos"] == pos and p.get("defcon_per90") is not None]
-        if not group:
+    print("\ndefcon is threshold-aware, hinged BEFORE shrinking")
+    rated = [p for p in pool if (p.get("rate_observed") or {}).get("defcon_surplus_per90") is not None]
+    check("surplus is published as its own observed rate", len(rated) > 0, f"n={len(rated)}")
+    # The regression: hinging the SHRUNK average cancelled the term, because
+    # shrinkage pulls everyone below a bar the positional mean already sits under.
+    # A player who cleared the bar in a real match must show real surplus.
+    never = [p for p in rated if (p["rate_observed"].get("defcon_hit_rate") or 0) == 0]
+    check("a player who never cleared the bar has zero raw surplus",
+          all(p["rate_observed"]["defcon_surplus_per90"] == 0 for p in never),
+          f"n={len(never)}")
+    check("nonzero surplus implies the bar was actually cleared",
+          all(p["rate_observed"]["defcon_hit_rate"] > 0 for p in rated
+              if p["rate_observed"]["defcon_surplus_per90"] > 0),
+          "the converse does not hold -- see the exact-threshold case below")
+    # Directly exercise the ordering bug: hinge the season average and a genuine
+    # threshold-clearer reads zero. Hinge per match and he does not.
+    def rates(dc, pos="MID"):
+        hist = [{"round": i + 1, "minutes": 90, "starts": 1, "expected_goals": "0",
+                 "expected_assists": "0", "defensive_contribution": x, "bonus": 0,
+                 "total_points": 2} for i, x in enumerate(dc)]
+        return s.compute_player_stats(hist, 5.0, 10, pos)
+    big = rates([16, 3])
+    check("one big match is not averaged away below the bar",
+          big["defcon_surplus_per90"] > 0,
+          f"dc=[16,3] -> per90 avg {big['defcon_per90']:.1f} (under 12), surplus "
+          f"{big['defcon_surplus_per90']:.2f}")
+    check("exactly at the bar scores the hit but no surplus",
+          rates([12])["defcon_hit_rate"] == 1.0 and rates([12])["defcon_surplus_per90"] == 0.0,
+          "hit_rate carries the points, surplus carries the margin")
+    check("just under the bar scores neither",
+          rates([11])["defcon_hit_rate"] == 0.0 and rates([11])["defcon_surplus_per90"] == 0.0)
+    # The original complaint: sub-threshold volume must not separate players.
+    for pos in s.DEFCON_THRESHOLD_BY_POS:
+        group = [p for p in never if p["pos"] == pos]
+        if len(group) < 2:
             continue
-        check(f"{pos}: surplus is max(0, rate - {threshold})",
-              all(abs(p["defcon_surplus_per90"] - max(0.0, p["defcon_per90"] - threshold)) < 5e-3
-                  for p in group), f"n={len(group)}")
-        below = [p for p in group if p["defcon_per90"] < threshold]
-        check(f"{pos}: sub-threshold volume scores zero regardless of size",
-              len({p["defcon_surplus_per90"] for p in below}) <= 1,
-              f"{len(below)} below the bar, all at "
-              f"{below[0]['defcon_surplus_per90'] if below else 'n/a'}")
+        zs = [p["rank_components"]["defcon_surplus_per90"] for p in group
+              if p["rank_components"].get("defcon_surplus_per90") is not None]
+        if len(zs) < 2:
+            continue
+        check(f"{pos}: players who never scored DefCon are not spread apart",
+              max(zs) - min(zs) < 1.0, f"z span {max(zs) - min(zs):.2f} over {len(zs)} players")
+
+    print("\nxgi does not penalise goalkeepers")
+    gk = [p for p in pool if p["pos"] == "GKP"]
+    if gk:
+        check("xgi_per90 is not scored for keepers",
+              all(p["rank_components"].get("xgi_per90") is None for p in gk),
+              f"n={len(gk)}")
+        check("keepers still carry the raw figure for display",
+              all("xgi_per90" in p for p in gk))
+        check("keeper coverage falls honestly rather than silently",
+              all(p["rank_coverage"] < 1.0 for p in gk),
+              f"coverage {min(p['rank_coverage'] for p in gk):.2f}")
+        check("outfielders still score xgi",
+              any(p["rank_components"].get("xgi_per90") is not None
+                  for p in pool if p["pos"] != "GKP"))
 
     print("\nnear-constant components cannot explode")
     # Direct check on the guard: one outlier against an otherwise identical field
