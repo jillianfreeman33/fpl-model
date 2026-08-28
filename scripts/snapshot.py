@@ -312,7 +312,13 @@ def compute_player_stats(history, price, total_points, pos):
         "minutes_total": minutes_total,
         "minutes_per_app": round(minutes_total / apps, 1) if apps else None,
         "starts": starts,
+        # apps counts gameweeks he PLAYED (a history row with minutes above 0).
+        # gameweeks_on_team counts every gameweek he was registered, played or
+        # not: FPL emits a history row for an unused substitute too, zeroed out.
+        # That row is what makes the difference between "did not start" and "was
+        # not there", and it is the honest denominator for a start rate.
         "apps": apps,
+        "gameweeks_on_team": len(history),
         "xg_per90": raw("xg", "nineties"),
         "xa_per90": raw("xa", "nineties"),
         "xgi_per90": round(totals["xg"] / nineties + totals["xa"] / nineties, 2) if nineties else None,
@@ -956,14 +962,19 @@ def start_share(player):
     null. That distinction is the whole point: null means "we do not know", 0.0
     means "we know, and it is none".
 
-    Known limitation: a player who joined mid-season is measured against
-    gameweeks he could not have played. The public API exposes no signing date,
-    so this reads as a genuine absence until he accumulates starts. Same
-    direction of error as the old metric, but bounded and visible."""
-    club_gameweeks = player.get("club_gameweeks_played")
-    if not club_gameweeks:
-        return None  # nothing played league-wide yet; genuinely unknown
-    return round(min((player.get("starts") or 0) / club_gameweeks, 1.0), 3)
+    Counted over the gameweeks he was actually registered, not the gameweeks his
+    club has played. FPL emits a history row for every gameweek a player is in a
+    squad -- an unused substitute gets a zeroed row -- so the row count is
+    exactly "gameweeks he could have started". That handles a mid-season signing
+    for free: he is measured from the point he arrives, not penalised for
+    gameweeks that happened before he was there.
+
+    Known limitation: a player transferred between two Premier League clubs
+    keeps one continuous history, so his denominator spans both spells."""
+    on_team = player.get("gameweeks_on_team")
+    if not on_team:
+        return None  # never registered anywhere; genuinely unknown
+    return round(min((player.get("starts") or 0) / on_team, 1.0), 3)
 
 
 def compute_rank(values, pos, pool_stats):
@@ -1696,7 +1707,7 @@ def main():
         "minutes_total": None, "minutes_per_app": None, "starts": None, "apps": None,
         "xg_per90": None, "xa_per90": None, "xgi_per90": None, "defcon_per90": None,
         "defcon_hit_rate": None, "defcon_surplus_per90": None,
-        "club_gameweeks_played": 0, "start_share": None,
+        "club_gameweeks_played": 0, "gameweeks_on_team": 0, "start_share": None,
         "points_per_million": None, "bonus_total": None,
         "bonus_per90": None, "rate_shrinkage_weight": None,
         "fixture_score": None, "fdr_next3": None, "fdr_next1": None,
@@ -1865,7 +1876,8 @@ def main():
         print(f"\n{len(idle)} player(s) have not started every club gameweek:")
         for p in sorted(idle, key=lambda x: x["start_share"]):
             print(f"  {p['name']:<20} {p['club']:<4} started {p['starts']}/"
-                  f"{p['club_gameweeks_played']} -> start_share {p['start_share']:.2f}, "
+                  f"{p['gameweeks_on_team']} registered ({p['club_gameweeks_played']} club GWs)"
+                  f" -> start_share {p['start_share']:.2f}, "
                   f"penalty {p['participation_penalty']}, rank_score {p['rank_score']}")
 
     if inert_report:

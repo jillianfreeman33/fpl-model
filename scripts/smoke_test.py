@@ -98,7 +98,15 @@ def fake_get(path, **params):
     if path.startswith("element-summary/"):
         pid = int(path.split("/")[1])
         el = next(e for e in ELEMENTS if e["id"] == pid)
-        rounds = [] if el["minutes"] == 0 else [
+        # FPL emits a zeroed history row for a gameweek the player was
+        # registered but did not play (verified against Hughes in production),
+        # so a non-player has rows, not an empty list. The stub returned [],
+        # which made gameweeks_on_team 0 and silently disabled the participation
+        # penalty in the test while it fired correctly in production.
+        rounds = [{"round": r, "minutes": 0, "starts": 0, "expected_goals": "0.00",
+                   "expected_assists": "0.00", "defensive_contribution": 0,
+                   "bonus": 0, "total_points": 0}
+                  for r in range(1, 4)] if el["minutes"] == 0 else [
             {"round": r,
              "minutes": 90 - (pid % 4) * 15,
              "starts": 1 if (pid + r) % 5 else 0,
@@ -362,9 +370,16 @@ def main():
           all(p["start_share"] == 0.0 for p in sat), f"n={len(sat)}")
     check("it is 0.0, not null -- null would mean 'unknown'",
           all(p["start_share"] is not None for p in sat))
-    check("start_share denominator is the CLUB's gameweeks, not appearances",
-          all(p["start_share"] == round(min(p["starts"] / p["club_gameweeks_played"], 1.0), 3)
-              for p in pool if p.get("club_gameweeks_played")))
+    check("start_share denominator is REGISTERED gameweeks, not appearances",
+          all(p["start_share"] == round(min(p["starts"] / p["gameweeks_on_team"], 1.0), 3)
+              for p in pool if p.get("gameweeks_on_team")))
+    check("a zero-minute gameweek still counts in the denominator",
+          all(p["gameweeks_on_team"] >= p["apps"] for p in pool),
+          "registered >= played for every player")
+    benched = [p for p in pool if p["gameweeks_on_team"] > p["apps"]]
+    check("being registered but unused lowers start_share",
+          all(p["start_share"] < 1.0 for p in benched),
+          f"{len(benched)} player(s) registered without playing every week")
     check("non-participation is penalised, not shrunk toward the mean",
           all(p["participation_penalty"] == s.PARTICIPATION_PENALTY for p in sat),
           f"full penalty {s.PARTICIPATION_PENALTY}")
