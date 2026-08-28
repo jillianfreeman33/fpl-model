@@ -90,7 +90,6 @@ RATE_STATS = {
 RANK_WEIGHTS = {
     "xgi_per90": 3.0,          # attacking output (xG + xA per 90)
     "minutes_per_app": 2.0,    # how long they last when they play
-    "starts_rate": 1.5,        # started vs came off the bench
     "fixture_score": 2.0,      # opponent difficulty, next 6
     "fdr_next3": 1.0,          # opponent difficulty, next 3 (transfer horizon)
     "fdr_next1": 0.5,          # opponent difficulty, the very next game
@@ -118,6 +117,28 @@ RANK_WEIGHTS = {
 # space: a player half likely to feature loses half this many z-units. Players at
 # 0.0 (injured, suspended, unavailable, not in squad) are excluded outright.
 AVAILABILITY_PENALTY = 1.0
+
+# Participation is deliberately NOT a z-scored component either, for the same
+# reason and then some.
+#
+# starts_rate was starts / apps, which conditions on having played: it answers
+# "when he turned out, did he start", and cannot express "he has not turned out
+# at all". That case divides 0 by 0 and lands as null -- read downstream as
+# MISSING DATA rather than as a measured zero. Coverage shrinkage then pulls the
+# score toward the pool mean, and for a player who belongs at the floor, pulling
+# toward the middle is a promotion. Hughes has not played a minute and ranked
+# 41st of 75 on seven terms, four of which describe Crystal Palace.
+#
+# start_share fixes the denominator: starts over the gameweeks his CLUB has
+# played, so not playing is 0.0 and is a fact rather than a gap.
+#
+# It is applied as a bounded penalty rather than z-scored because it is a
+# bounded near-constant field, which has now burned this model three times --
+# availability at -7.01 sigma, the DefCon hinge at +4.90, and this one would be
+# -8.60 with 74 of 75 players at 1.0. A player who started every one of his
+# club's gameweeks loses nothing; one who started none loses the full penalty,
+# pro rata in between. Sized at the weight the old component carried.
+PARTICIPATION_PENALTY = 1.5
 
 # Components whose scale differs by position for reasons unrelated to quality,
 # so they are z-scored WITHIN position. fixture_score/fdr_next3 read opposite
@@ -906,7 +927,6 @@ def derive_rank_inputs(player):
         # better. Excluded rather than scored, so their coverage honestly falls.
         "xgi_per90": None if player["pos"] == "GKP" else player.get("xgi_per90"),
         "minutes_per_app": player.get("minutes_per_app"),
-        "starts_rate": round(player["starts"] / apps, 3) if apps and player.get("starts") is not None else None,
         "fixture_score": player.get("fixture_score"),
         "fdr_next3": player.get("fdr_next3"),
         "fdr_next1": player.get("fdr_next1"),
@@ -924,7 +944,26 @@ def derive_rank_inputs(player):
         "rival_ownership": player.get("rival_ownership"),
         "availability": availability(player),
         "eligible": eligible(player),
+        "start_share": start_share(player),
     }
+
+
+def start_share(player):
+    """Share of his club's played gameweeks that this player started.
+
+    The denominator is the CLUB's gameweeks, not the player's appearances, so a
+    player who has not featured scores 0.0 rather than dividing 0 by 0 into a
+    null. That distinction is the whole point: null means "we do not know", 0.0
+    means "we know, and it is none".
+
+    Known limitation: a player who joined mid-season is measured against
+    gameweeks he could not have played. The public API exposes no signing date,
+    so this reads as a genuine absence until he accumulates starts. Same
+    direction of error as the old metric, but bounded and visible."""
+    club_gameweeks = player.get("club_gameweeks_played")
+    if not club_gameweeks:
+        return None  # nothing played league-wide yet; genuinely unknown
+    return round(min((player.get("starts") or 0) / club_gameweeks, 1.0), 3)
 
 
 def compute_rank(values, pos, pool_stats):
@@ -971,13 +1010,17 @@ def compute_rank(values, pos, pool_stats):
         return {"rank_score": None, "rank_score_before_availability": None,
                 "availability_penalty": None, "rank_basis": rank_basis, "rank_components": components,
                 "weights_used": weights_used, "rank_coverage": coverage,
-                "rank_fixture_proxy": fixture_proxy,
+                "rank_fixture_proxy": fixture_proxy, "participation_penalty": None,
                 "rank_excluded_reason": f"insufficient data (coverage {coverage} < {RANK_MIN_COVERAGE})"}
 
     score = sum(RANK_WEIGHTS[n] * z[n] for n in rank_basis) / total_weight
     penalty = round(AVAILABILITY_PENALTY * (1.0 - values["availability"]), 4)
-    return {"rank_score": round(score - penalty, 4), "rank_score_before_availability": round(score, 4),
-            "availability_penalty": penalty, "rank_basis": rank_basis, "rank_components": components,
+    share = values["start_share"]
+    participation = 0.0 if share is None else round(PARTICIPATION_PENALTY * (1.0 - share), 4)
+    return {"rank_score": round(score - penalty - participation, 4),
+            "rank_score_before_availability": round(score, 4),
+            "availability_penalty": penalty, "participation_penalty": participation,
+            "rank_basis": rank_basis, "rank_components": components,
             "weights_used": weights_used, "rank_coverage": coverage,
             "rank_fixture_proxy": fixture_proxy, "rank_excluded_reason": None}
 
@@ -996,7 +1039,7 @@ def rank_players(pool):
         inputs.append(values)
         # Surface the derived quantities so the score stays auditable.
         player.update({k: values[k] for k in
-                       ("starts_rate", "availability", "eligible")})
+                       ("availability", "eligible", "start_share")})
 
     pool_stats = compute_pool_stats(inputs, RANK_WEIGHTS.keys(), POSITION_RELATIVE_COMPONENTS)
     for player, values in zip(pool, inputs):
@@ -1446,6 +1489,20 @@ def logged_gameweeks():
         return {row["gameweek"] for row in csv.DictReader(f) if row.get("gameweek")}
 
 
+def club_gameweeks_played(fixtures, teams_by_id):
+    """How many gameweeks each club has actually played.
+
+    Same rule as everywhere else -- a fixture is played when it has a score --
+    so this cannot disagree with data_maturity or the team match log."""
+    counts = defaultdict(int)
+    for fixture in fixtures:
+        if fixture.get("team_h_score") is None:
+            continue
+        for side in ("team_h", "team_a"):
+            counts[teams_by_id[fixture[side]]["short_name"]] += 1
+    return dict(counts)
+
+
 def gameweek_progress(fixtures):
     """Reconcile the several senses of "this gameweek is done".
 
@@ -1627,6 +1684,7 @@ def main():
     # All three senses of "done" come from one place -- see gameweek_progress.
     progress = gameweek_progress(fixtures)
     latest_finished_gw = progress["latest_complete"]
+    club_gameweeks = club_gameweeks_played(fixtures, teams_by_id)
     entry_info = get(f"entry/{entry_id}/")
     entry_history = get(f"entry/{entry_id}/history/")
     my_picks_resp = get(f"entry/{entry_id}/event/{picks_gw}/picks/")
@@ -1638,6 +1696,7 @@ def main():
         "minutes_total": None, "minutes_per_app": None, "starts": None, "apps": None,
         "xg_per90": None, "xa_per90": None, "xgi_per90": None, "defcon_per90": None,
         "defcon_hit_rate": None, "defcon_surplus_per90": None,
+        "club_gameweeks_played": 0, "start_share": None,
         "points_per_million": None, "bonus_total": None,
         "bonus_per90": None, "rate_shrinkage_weight": None,
         "fixture_score": None, "fdr_next3": None, "fdr_next1": None,
@@ -1661,6 +1720,10 @@ def main():
     attach_player_stats(my_squad, elements, cache, latest_finished_gw)
     attach_player_stats(watchlist, elements, cache, latest_finished_gw)
     save_element_summary_cache(cache)
+
+    # start_share needs the club's gameweek count, not the player's appearances.
+    for player in my_squad + watchlist:
+        player["club_gameweeks_played"] = club_gameweeks.get(player["club"], 0)
 
     # Rates are shrunk toward their positional prior across the whole pool at
     # once, so squad and watchlist are measured against the same yardstick.
@@ -1795,6 +1858,15 @@ def main():
             print(f"  {p['name']:<20} {p['club']:<4} {p['pos']:<4} "
                   f"rank_score={p['rank_score']} coverage={p['rank_coverage']} "
                   f"source={p['source']} basis={','.join(p['rank_basis'])}")
+
+    idle = [p for p in all_watched_players
+            if p.get("start_share") is not None and p["start_share"] < 1.0]
+    if idle:
+        print(f"\n{len(idle)} player(s) have not started every club gameweek:")
+        for p in sorted(idle, key=lambda x: x["start_share"]):
+            print(f"  {p['name']:<20} {p['club']:<4} started {p['starts']}/"
+                  f"{p['club_gameweeks_played']} -> start_share {p['start_share']:.2f}, "
+                  f"penalty {p['participation_penalty']}, rank_score {p['rank_score']}")
 
     if inert_report:
         print(f"\n{len(inert_report)} component(s) currently inert -- contributing nothing:")

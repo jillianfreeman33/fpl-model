@@ -351,8 +351,42 @@ def main():
 
     print("\nweights")
     check("all weights positive", all(w > 0 for w in s.RANK_WEIGHTS.values()))
-    check("13 z-scored components", len(s.RANK_WEIGHTS) == 13, str(len(s.RANK_WEIGHTS)))
+    check("12 z-scored components", len(s.RANK_WEIGHTS) == 12, str(len(s.RANK_WEIGHTS)))
     check("availability is not z-scored", "availability" not in s.RANK_WEIGHTS)
+    check("participation is not z-scored either",
+          "start_share" not in s.RANK_WEIGHTS and "starts_rate" not in s.RANK_WEIGHTS)
+
+    print("\nnot playing is a measured zero, not missing data")
+    sat = [p for p in pool if (p["minutes_total"] or 0) == 0]
+    check("a player with no appearances still gets a start_share",
+          all(p["start_share"] == 0.0 for p in sat), f"n={len(sat)}")
+    check("it is 0.0, not null -- null would mean 'unknown'",
+          all(p["start_share"] is not None for p in sat))
+    check("start_share denominator is the CLUB's gameweeks, not appearances",
+          all(p["start_share"] == round(min(p["starts"] / p["club_gameweeks_played"], 1.0), 3)
+              for p in pool if p.get("club_gameweeks_played")))
+    check("non-participation is penalised, not shrunk toward the mean",
+          all(p["participation_penalty"] == s.PARTICIPATION_PENALTY for p in sat),
+          f"full penalty {s.PARTICIPATION_PENALTY}")
+    everpresent = [p for p in pool if p.get("start_share") == 1.0]
+    check("an ever-present pays nothing",
+          all(p["participation_penalty"] == 0.0 for p in everpresent), f"n={len(everpresent)}")
+    check("the penalty is bounded, never a runaway z",
+          all(0.0 <= p["participation_penalty"] <= s.PARTICIPATION_PENALTY
+              for p in pool if p.get("participation_penalty") is not None))
+    # Compared like for like: an injured ever-present can legitimately rank below
+    # a fit non-player, since the two penalties answer different questions.
+    fit_ever = [p for p in everpresent
+                if p.get("availability") == 1.0 and p["rank_score"] is not None]
+    fit_sat = [p for p in sat if p.get("availability") == 1.0 and p["rank_score"] is not None]
+    if fit_sat and fit_ever:
+        best_sat = max(p["rank_score"] for p in fit_sat)
+        check("a fit player who has not played ranks below every fit ever-present",
+              best_sat < min(p["rank_score"] for p in fit_ever),
+              f"best non-player {best_sat:+.3f} vs worst ever-present "
+              f"{min(p['rank_score'] for p in fit_ever):+.3f}")
+        check("and the gap is the participation penalty, not an outsized z",
+              all(abs(p["participation_penalty"]) <= s.PARTICIPATION_PENALTY for p in fit_sat))
 
     print("\ndifferential tilt is one term, not two that cancel")
     check("global ownership no longer scores", "ownership" not in s.RANK_WEIGHTS)
