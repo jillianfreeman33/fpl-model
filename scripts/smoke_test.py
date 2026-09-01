@@ -30,6 +30,8 @@ TEAMS = [
          ("EVE", 3, 3), ("SUN", 2, 3), ("HUL", 2, 2), ("COV", 2, 2)], start=1)
 ]
 POS = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
+# Attacking output is structurally position-dependent in the real game.
+ATTACK_BY_POS = {1: 0.02, 2: 0.45, 3: 1.0, 4: 1.7}
 
 
 def make_elements():
@@ -110,8 +112,11 @@ def fake_get(path, **params):
             {"round": r,
              "minutes": 90 - (pid % 4) * 15,
              "starts": 1 if (pid + r) % 5 else 0,
-             "expected_goals": str(round(0.05 * (pid % 11), 3)),
-             "expected_assists": str(round(0.03 * (pid % 7), 3)),
+             # Scaled by position, as real attacking output is: keepers ~0,
+             # forwards highest. Without this the stub cannot exhibit the very
+             # cross-position tilt the two ranking scales exist to separate.
+             "expected_goals": str(round(0.05 * (pid % 11) * ATTACK_BY_POS[el["element_type"]], 3)),
+             "expected_assists": str(round(0.03 * (pid % 7) * ATTACK_BY_POS[el["element_type"]], 3)),
              "defensive_contribution": (pid % 13) + r,
              "bonus": (pid + r) % 4,
              "total_points": (pid + r) % 13}
@@ -119,11 +124,23 @@ def fake_get(path, **params):
         ]
         return {"history": rounds}
     if path.endswith("/history/"):
-        return {"current": [{"event": 1, "event_transfers": 0}], "chips": []}
+        # Two gameweeks, the second carrying a -4 hit, plus one chip. bboost
+        # deliberately, not wildcard or freehit: those two skip the free-transfer
+        # deduction, so using one here would change what compute_free_transfers
+        # returns and confound a test about history reaching the output.
+        return {
+            "current": [
+                {"event": 1, "points": 54, "total_points": 54,
+                 "event_transfers": 0, "event_transfers_cost": 0},
+                {"event": 2, "points": 61, "total_points": 115,
+                 "event_transfers": 2, "event_transfers_cost": 4},
+            ],
+            "chips": [{"name": "bboost", "event": 2}],
+        }
     if "/event/" in path and path.endswith("/picks/"):
         entry = int(path.split("/")[1])
         if entry < 900:
-            return {"picks": MY_PICKS}
+            return {"picks": MY_PICKS}  # carries is_captain/multiplier/position
         offset = (entry - 900) * 3
         return {"picks": [
             {"element": ELEMENTS[(offset + k) % len(ELEMENTS)]["id"],
@@ -553,6 +570,76 @@ def main():
     check("locked never exceeds complete", dm["gameweeks_locked"] <= dm["gameweeks_complete"])
     check("per-gameweek fixture counts reported",
           set(dm["fixtures_played_by_gameweek"]) == {str(g) for g in played_gws})
+
+    print("\nmy own picks survive the picks response")
+    for field in ("is_captain", "is_vice_captain", "multiplier", "squad_position"):
+        check(f"every squad player carries {field}", all(field in p for p in squad))
+    check("exactly one captain in my squad",
+          sum(1 for p in squad if p["is_captain"]) == 1,
+          next((p["name"] for p in squad if p["is_captain"]), "none"))
+    check("exactly one vice-captain in my squad",
+          sum(1 for p in squad if p["is_vice_captain"]) == 1)
+    check("the captain carries a multiplier above 1",
+          all(p["multiplier"] > 1 for p in squad if p["is_captain"]))
+    check("squad positions span the full 15",
+          sorted(p["squad_position"] for p in squad) == list(range(1, 16)))
+    # The point of storing it: the captain must be readable without going via
+    # rivals[], which is sliced to the top 20 and can drop me entirely.
+    check("my captain is readable without consulting rivals[]",
+          any(p["is_captain"] for p in squad), "independent of league standing")
+
+    print("\nentry_history reaches the snapshot")
+    eh = snap["entry_history"]
+    check("entry_history present", "entry_history" in snap)
+    check("no field names missing from the response",
+          eh["missing_fields"] == [], str(eh["missing_fields"]))
+    check("one row per played gameweek", len(eh["gameweeks"]) == 2, str(len(eh["gameweeks"])))
+    for field in s.ENTRY_HISTORY_GW_FIELDS:
+        check(f"gameweek rows carry {field}", all(field in g for g in eh["gameweeks"]))
+    hit = next((g for g in eh["gameweeks"] if g["event_transfers_cost"]), None)
+    check("a points hit survives into the snapshot",
+          hit is not None and hit["event_transfers_cost"] == 4,
+          f"GW{hit['event']} cost {hit['event_transfers_cost']}" if hit else "no hit found")
+    check("points and total_points are distinct running figures",
+          [g["points"] for g in eh["gameweeks"]] == [54, 61]
+          and [g["total_points"] for g in eh["gameweeks"]] == [54, 115])
+    check("chips survive with name and event",
+          eh["chips"] == [{"name": "bboost", "event": 2}], str(eh["chips"]))
+    check("the chip used is not one that alters free-transfer arithmetic",
+          all(c["name"] not in s.CHIPS_THAT_SKIP_TRANSFER_DEDUCTION for c in eh["chips"]),
+          "bboost, so free_transfers is unaffected by this fixture")
+
+    print("\ntwo scales: overall and within position")
+    check("every player carries a position_rank_score",
+          all(p.get("position_rank_score") is not None for p in pool
+              if p["rank_score"] is not None))
+    check("watchlist_by_position covers every position present",
+          set(snap["watchlist_by_position"]) == {p["pos"] for p in watch},
+          str(sorted(snap["watchlist_by_position"])))
+    for pos, rows in snap["watchlist_by_position"].items():
+        check(f"{pos} list is ordered by position_rank_score",
+              [r["position_rank_score"] for r in rows]
+              == sorted((r["position_rank_score"] for r in rows), reverse=True),
+              f"n={len(rows)}")
+    check("per-position lists together cover the whole watchlist",
+          sum(len(v) for v in snap["watchlist_by_position"].values()) == len(watch))
+    # The defining property: within position, EVERY component is normalised, so
+    # each position group centres on zero rather than inheriting a positional tilt.
+    for pos in {p["pos"] for p in pool}:
+        for name in ("xgi_per90", "minutes_per_app"):
+            zs = [p["position_rank_components"][name] for p in pool
+                  if p["pos"] == pos and p.get("position_rank_components", {}).get(name) is not None]
+            if len(zs) > 2:
+                check(f"{pos} {name} centres on 0 within position",
+                      abs(sum(zs) / len(zs)) < 0.35, f"mean {sum(zs)/len(zs):+.3f}")
+    # And the contrast that motivates having both scales at all.
+    pooled = {pos: [p["rank_components"]["xgi_per90"] for p in pool
+                    if p["pos"] == pos and p["rank_components"].get("xgi_per90") is not None]
+              for pos in {p["pos"] for p in pool}}
+    spreads = [sum(v) / len(v) for v in pooled.values() if v]
+    check("the overall scale still separates positions on attacking output",
+          len(spreads) > 1 and max(spreads) - min(spreads) > 0.3,
+          f"cross-position spread {max(spreads) - min(spreads):.2f} (pooled, by design)")
 
     print("\ntransfer options")
     opts = snap["transfer_options"]

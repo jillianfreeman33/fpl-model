@@ -977,7 +977,7 @@ def start_share(player):
     return round(min((player.get("starts") or 0) / on_team, 1.0), 3)
 
 
-def compute_rank(values, pos, pool_stats):
+def compute_rank(values, pos, pool_stats, position_relative=None):
     """Weighted mean of component z-scores, shrunk by how much of the model a
     player actually has data for.
 
@@ -998,9 +998,11 @@ def compute_rank(values, pos, pool_stats):
     penalty plus `eligible: false`. Nulling them out lost real information --
     that an injured player was nonetheless the strongest option at his position
     is exactly what you need in order to decide whether to wait for him."""
+    if position_relative is None:
+        position_relative = POSITION_RELATIVE_COMPONENTS
     z, components = {}, {}
     for name in RANK_WEIGHTS:
-        stats = lookup_stats(pool_stats, name, pos, POSITION_RELATIVE_COMPONENTS)
+        stats = lookup_stats(pool_stats, name, pos, position_relative)
         raw = zscore(values[name], stats)
         if raw is not None and name in LOWER_IS_BETTER:
             raw = -raw
@@ -1052,10 +1054,26 @@ def rank_players(pool):
         player.update({k: values[k] for k in
                        ("availability", "eligible", "start_share")})
 
+    # Two scales, deliberately. The overall score keeps most components pooled,
+    # so a forward's genuine scoring advantage over a defender still shows and a
+    # squad-wide ranking means something. The position score normalises EVERY
+    # component within position, which is the scale that matches how a transfer
+    # is actually made: you replace a defender with a defender, and asking
+    # whether Calafiori out-produces Isak has no decision behind it.
     pool_stats = compute_pool_stats(inputs, RANK_WEIGHTS.keys(), POSITION_RELATIVE_COMPONENTS)
+    all_relative = set(RANK_WEIGHTS)
+    position_stats = compute_pool_stats(inputs, RANK_WEIGHTS.keys(), all_relative)
     for player, values in zip(pool, inputs):
         player.update(compute_rank(values, player["pos"], pool_stats))
-    return {(f"{k[0]}|{k[1]}" if isinstance(k, tuple) else k): v for k, v in pool_stats.items()}
+        within = compute_rank(values, player["pos"], position_stats, all_relative)
+        player.update({
+            "position_rank_score": within["rank_score"],
+            "position_rank_components": within["rank_components"],
+            "position_rank_coverage": within["rank_coverage"],
+            "position_rank_basis": within["rank_basis"],
+        })
+    flatten = lambda s: {(f"{k[0]}|{k[1]}" if isinstance(k, tuple) else k): v for k, v in s.items()}
+    return flatten(pool_stats), flatten(position_stats)
 
 
 def inert_components(pool_stats):
@@ -1074,6 +1092,31 @@ def inert_components(pool_stats):
             {"group": group, "n": stats["n"],
              "reason": "zero variance" if stats["std"] == 0 else "near-constant (IQR 0)"})
     return report
+
+
+def watchlist_by_position(watchlist):
+    """The same players, ranked on their own position's scale.
+
+    Kept as a light index rather than duplicated player objects: the full record
+    already sits in `watchlist`, so this carries only what an ordering needs.
+    Both scores appear on each row so the two views can be compared without
+    cross-referencing."""
+    groups = {}
+    for player in watchlist:
+        groups.setdefault(player["pos"], []).append(player)
+    ordered = {}
+    for pos, players in groups.items():
+        ranked = sorted(players,
+                        key=lambda p: (p["position_rank_score"] is None,
+                                       -(p["position_rank_score"] or 0)))
+        ordered[pos] = [
+            {"player_id": p["player_id"], "name": p["name"], "club": p["club"],
+             "price": p["price"], "position_rank_score": p["position_rank_score"],
+             "position_rank_coverage": p["position_rank_coverage"],
+             "rank_score": p["rank_score"]}
+            for p in ranked
+        ]
+    return ordered
 
 
 def sort_by_rank(players):
@@ -1630,6 +1673,35 @@ def append_calibration_rows(events, elements, cache, latest_finished_gw):
     return appended
 
 
+ENTRY_HISTORY_GW_FIELDS = ("event", "points", "total_points",
+                           "event_transfers", "event_transfers_cost")
+ENTRY_HISTORY_CHIP_FIELDS = ("name", "event")
+
+
+def build_entry_history(history):
+    """Your own gameweek-by-gameweek record, which was fetched and discarded.
+
+    Points hits and chip usage are the only things about a past gameweek that
+    cannot be reconstructed from data/deadline_state plus the element-summary
+    cache -- both are decisions rather than outcomes, and nothing else records
+    them.
+
+    Field names are checked against the response rather than assumed. A missing
+    field is reported and left null; inventing a substitute would put a number
+    in the log that no endpoint ever returned."""
+    missing = set()
+    gameweeks = []
+    for row in sorted(history.get("current", []), key=lambda r: r.get("event") or 0):
+        missing.update(f for f in ENTRY_HISTORY_GW_FIELDS if f not in row)
+        gameweeks.append({f: row.get(f) for f in ENTRY_HISTORY_GW_FIELDS})
+    chips = []
+    for chip in history.get("chips", []):
+        missing.update(f for f in ENTRY_HISTORY_CHIP_FIELDS if f not in chip)
+        chips.append({f: chip.get(f) for f in ENTRY_HISTORY_CHIP_FIELDS})
+    return {"gameweeks": gameweeks, "chips": chips,
+            "missing_fields": sorted(missing)}
+
+
 def build_transfer_options(my_squad, watchlist, bank, free_transfers):
     """Which upgrades you can actually afford right now.
 
@@ -1713,10 +1785,21 @@ def main():
         "fixture_score": None, "fdr_next3": None, "fdr_next1": None,
         "rival_ownership": None, "league_ownership": None,
     }
-    my_squad = [
-        player_record(elements[pid], teams_by_id, types_by_id, empty_stats)
-        for pid in (p["element"] for p in my_picks)
-    ]
+    # Keep the pick metadata, not just the element id. Without it your own
+    # captain is only recoverable by finding yourself inside rivals[], which is
+    # sliced to the top 20 -- so in a 25-entrant league it disappears the moment
+    # you drop out of that slice. The picks endpoint has already been fetched;
+    # these four fields were being read and thrown away.
+    my_squad = []
+    for pick in my_picks:
+        record = player_record(elements[pick["element"]], teams_by_id, types_by_id, empty_stats)
+        record.update({
+            "is_captain": bool(pick.get("is_captain")),
+            "is_vice_captain": bool(pick.get("is_vice_captain")),
+            "multiplier": pick.get("multiplier"),
+            "squad_position": pick.get("position"),
+        })
+        my_squad.append(record)
 
     # Neither depends on which players we track, so both can precede selection
     # -- which is what lets the candidate pool be chosen on fixture-aware merit.
@@ -1757,7 +1840,7 @@ def main():
         player["source"] = "squad"
     for player in watchlist:
         player["source"] = "watchlist"
-    pool_stats = rank_players(my_squad + watchlist)
+    pool_stats, position_stats = rank_players(my_squad + watchlist)
     inert_report = inert_components(
         {tuple(k.split("|")) if "|" in k else k: v for k, v in pool_stats.items()})
     sort_by_rank(watchlist)
@@ -1777,6 +1860,7 @@ def main():
     bank = entry_info.get("last_deadline_bank", 0) / 10
     squad_value = entry_info.get("last_deadline_value", 0) / 10
     free_transfers = compute_free_transfers(entry_history, picks_gw)
+    history_record = build_entry_history(entry_history)
     transfer_options = build_transfer_options(my_squad, watchlist, bank, free_transfers)
 
     all_watched_players = my_squad + watchlist
@@ -1811,6 +1895,8 @@ def main():
         "my_squad": my_squad,
         "watchlist": watchlist,
         "watchlist_rank_stats": pool_stats,
+        "watchlist_by_position": watchlist_by_position(watchlist),
+        "position_rank_stats": position_stats,
         "inert_components": inert_report,
         "rate_priors": rate_priors,
         "rate_shrinkage_minutes": RATE_SHRINKAGE_MINUTES,
@@ -1826,6 +1912,7 @@ def main():
         "bank": bank,
         "squad_value": squad_value,
         "free_transfers": free_transfers,
+        "entry_history": history_record,
         "data_maturity": data_maturity,
     }
 
@@ -1869,6 +1956,10 @@ def main():
             print(f"  {p['name']:<20} {p['club']:<4} {p['pos']:<4} "
                   f"rank_score={p['rank_score']} coverage={p['rank_coverage']} "
                   f"source={p['source']} basis={','.join(p['rank_basis'])}")
+
+    if history_record["missing_fields"]:
+        print("WARNING: entry/history fields absent from the live response, left null: "
+              + ", ".join(history_record["missing_fields"]), file=sys.stderr)
 
     idle = [p for p in all_watched_players
             if p.get("start_share") is not None and p["start_share"] < 1.0]
