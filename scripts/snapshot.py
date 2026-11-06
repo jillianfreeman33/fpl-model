@@ -1702,6 +1702,58 @@ def build_entry_history(history):
             "missing_fields": sorted(missing)}
 
 
+FREE_TRANSFER_MIN = 0
+FREE_TRANSFER_MAX = 5
+
+
+def validate_free_transfers(value):
+    """free_transfers is an integer 0-5, or null when it could not be read.
+
+    Anything else means the value came from somewhere it should not have. A
+    float, a string, or 7 is not a conservative reading of the rules -- it is a
+    number this pipeline invented, and a transfer decision would be made on it."""
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SystemExit(
+            f"free_transfers must be an int or None, got {type(value).__name__}: {value!r}")
+    if not FREE_TRANSFER_MIN <= value <= FREE_TRANSFER_MAX:
+        raise SystemExit(
+            f"free_transfers out of range: {value} (expected "
+            f"{FREE_TRANSFER_MIN}-{FREE_TRANSFER_MAX} or None)")
+
+
+def assert_fetched_at_advances(path, new_fetched_at):
+    """Refuse to replace a snapshot with one that is not newer.
+
+    Guards the case where the runner builds against a stale checkout, or clock
+    skew makes a fresh run look older than the file it overwrites. Writing the
+    older file would roll the published snapshot backwards, and every consumer
+    reads whatever is there as current."""
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path) as f:
+            previous = json.load(f).get("fetched_at")
+    except (OSError, ValueError) as exc:
+        print(f"WARNING: could not read the previous snapshot to compare "
+              f"fetched_at ({exc}); writing anyway", file=sys.stderr)
+        return
+    if not previous:
+        return
+    old, new = parse_iso(previous), parse_iso(new_fetched_at)
+    if old is None or new is None:
+        print(f"WARNING: unparseable fetched_at (old {previous!r}, new "
+              f"{new_fetched_at!r}); writing anyway", file=sys.stderr)
+        return
+    if new <= old:
+        raise SystemExit(
+            f"refusing to write a snapshot that is not newer: existing "
+            f"fetched_at {previous} >= new {new_fetched_at}. The checkout is "
+            f"stale or the clock is wrong; publishing this would roll the "
+            f"snapshot backwards for every consumer.")
+
+
 def build_transfer_options(my_squad, watchlist, bank, free_transfers):
     """Which upgrades you can actually afford right now.
 
@@ -1927,6 +1979,9 @@ def main():
     sealed = seal_predictions(events, now)
     appended = append_calibration_rows(events, elements, cache, latest_finished_gw)
     save_element_summary_cache(cache)
+
+    assert_fetched_at_advances(OUTPUT_PATH, snapshot["fetched_at"])
+    validate_free_transfers(snapshot["free_transfers"])
 
     with open(OUTPUT_PATH, "w") as f:
         json.dump(snapshot, f, separators=(",", ":"))

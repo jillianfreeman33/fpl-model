@@ -641,6 +641,36 @@ def main():
           len(spreads) > 1 and max(spreads) - min(spreads) > 0.3,
           f"cross-position spread {max(spreads) - min(spreads):.2f} (pooled, by design)")
 
+    print("\nfree_transfers is an int 0-5 or null, never anything else")
+    check("the live value passes validation",
+          s.validate_free_transfers(snap["free_transfers"]) is None,
+          f"free_transfers={snap['free_transfers']!r}")
+    for ok in (None, 0, 1, 5):
+        check(f"{ok!r} accepted", s.validate_free_transfers(ok) is None)
+    for bad in (-1, 6, 99, 1.5, "1", True, [1]):
+        try:
+            s.validate_free_transfers(bad)
+            check(f"{bad!r} rejected", False, "it was accepted")
+        except SystemExit as exc:
+            check(f"{bad!r} rejected", True, str(exc)[:58])
+
+    print("\na snapshot that is not newer is refused")
+    import tempfile as _tf
+    probe = os.path.join(_tf.mkdtemp(), "snapshot.json")
+    json.dump({"fetched_at": "2026-11-05T15:14:38+00:00"}, open(probe, "w"))
+    check("a newer fetched_at is allowed",
+          s.assert_fetched_at_advances(probe, "2026-11-06T09:00:00+00:00") is None)
+    for stale, label in (("2026-08-22T01:39:45+00:00", "the August file"),
+                         ("2026-11-05T15:14:38+00:00", "an identical timestamp")):
+        try:
+            s.assert_fetched_at_advances(probe, stale)
+            check(f"{label} is refused", False, "it was written")
+        except SystemExit as exc:
+            check(f"{label} is refused", True, str(exc)[:66])
+    check("a missing previous snapshot is not an error",
+          s.assert_fetched_at_advances(os.path.join(_tf.mkdtemp(), "none.json"),
+                                       "2026-11-06T09:00:00+00:00") is None)
+
     print("\ntransfer options")
     opts = snap["transfer_options"]
     check("affordable upgrades are position-legal and funded",
